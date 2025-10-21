@@ -1,4 +1,4 @@
-task: mbpp_sanitized_llada1.5
+task: mbpp_sanitized_llada
 dataset_path: json
 dataset_name: null
 dataset_kwargs:
