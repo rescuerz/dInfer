@@ -130,9 +130,9 @@ To simplify usage, we also include a ready‑to‑run bash script that con
 You only need to modify the configuration values in the script (e.g., model_path, parallel_decoding, threshold, tp_size, etc.),
 and then execute it to launch the full evaluation process.
 
-```python
+```bash
 cd evaluations
-bash eval_gsm8k.sh
+bash ./scripts/eval_gsm8k.sh
 ```
 
 
