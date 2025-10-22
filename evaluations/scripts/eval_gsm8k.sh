@@ -34,8 +34,8 @@ python eval_dinfer.py --tasks ${task} \
 # parallel=dp
 # accelerate launch eval_dinfer.py --tasks ${task} \
 # --confirm_run_unsafe_code --model dInfer_eval \
-# --model_args model_path=${model_path},gen_length=${length}block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},prefix_look=${prefix_look},after_look=${after_look},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},tp_size=${tp_size},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit},gpus=${gpus} \
-# --output_path ${output_path} --include_path ../tasks --apply_chat_template
+# --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},prefix_look=${prefix_look},after_look=${after_look},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},tp_size=${tp_size},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit},gpus=${gpus} \
+# --output_path ${output_path} --include_path ./tasks --apply_chat_template
 
 # use hierarchy mechanism for parallel decoding 
 parallel_decoding='hierarchy' 

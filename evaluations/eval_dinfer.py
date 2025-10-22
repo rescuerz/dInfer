@@ -135,7 +135,7 @@ class DInferEvalHarness(LM):
         self.gpus = gpus
         self.kwargs = kwargs
 
-        if "moe" in model_path:
+        if "moe" in model_path.lower():
             self.mask_id = 156895
             self.eos_id = 156892
             self.is_moe = True
