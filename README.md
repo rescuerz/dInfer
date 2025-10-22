@@ -136,7 +136,7 @@ For the llada‑moe model, we have adapted two benchmark tasks already integrate
 ### 1️⃣ Install Dependencies
 
 ```bash
-pip install -U accelerate evaluate datasets lm_eval
+pip install -U accelerate evaluate datasets lm_eval hf_transfer
 ```
 
 ### 2️⃣ Set Environment Variables

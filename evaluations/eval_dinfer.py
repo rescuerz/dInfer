@@ -28,7 +28,6 @@ from lm_eval.api.registry import register_model
 from dinfer.model import FusedOlmoeForCausalLM, LLaDAModelLM
 from dinfer import BlockIteratorFactory, KVCacheFactory
 from dinfer import ThresholdParallelDecoder,CreditThresholdParallelDecoder, HierarchyDecoder, BlockWiseDiffusionLLM, BlockWiseDiffusionLLMCont, SlidingWindowDiffusionLLM, SlidingWindowDiffusionLLMCont
-from dinfer import DiffusionLLMServing, SamplingParams
 from vllm import distributed
 from vllm.config import VllmConfig, set_current_vllm_config, get_current_vllm_config
 from vllm.config import ParallelConfig
