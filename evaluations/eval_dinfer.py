@@ -490,7 +490,7 @@ class DInferEvalHarness(LM):
                             prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
                     else:
                         dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True)
-                if args.use_cudagraph:
+                if args.use_compile and args.use_cudagraph:
                     warmup_cudagraph(rank, device, dllm, args.gen_len, args.block_length)
                 outputs = []
             
@@ -570,7 +570,7 @@ class DInferEvalHarness(LM):
     
         if self.parallel == 'dp':
             with set_current_vllm_config(self.vllm_config):
-                if self.use_cudagraph:
+                if self.use_compile and self.use_cudagraph:
                     warmup_cudagraph(self.rank, self.device, self.dllm, self.gen_length, self.block_length)
                 for i, req in enumerate(tqdm(requests, desc="Generating...")):
                     input_ids = all_input_ids[i]
