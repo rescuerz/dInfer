@@ -693,7 +693,8 @@ class OlmoeMoE(nn.Module):
         del self.experts.expert_map
         self.experts.register_buffer('expert_map', expert_map)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor,
+                num_experts_per_tok: Optional[torch.Tensor] = None) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
@@ -703,8 +704,10 @@ class OlmoeMoE(nn.Module):
         hidden_states = hidden_states.to(torch.float32)
         router_logits, _ = self.gate(hidden_states)
         hidden_states = hidden_states.to(original_dtype)
-        final_hidden_states = self.experts.forward_impl(hidden_states=hidden_states,
-                                           router_logits=router_logits)
+        final_hidden_states = self.experts.forward_impl(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            num_experts_per_tok=num_experts_per_tok)
         return final_hidden_states.view(orig_shape)
 
 
