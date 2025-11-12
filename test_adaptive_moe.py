@@ -4,12 +4,27 @@
 这个脚本验证修改后的vLLM是否正确支持per-token动态专家数。
 """
 
+import os
 import torch
 import sys
 sys.path.insert(0, 'python')
 
 from dinfer.model.modeling_fused_olmoe import OlmoeMoE
 from dinfer.model.configuration_olmoe import OlmoeConfig
+from vllm import distributed
+from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+
+
+def setup_environment():
+    """设置环境变量和分布式环境"""
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12347'  # 使用不同的端口避免冲突
+
+    # 初始化分布式环境
+    distributed.init_distributed_environment(1, 0, 'env://', 0, 'nccl')
+    distributed.initialize_model_parallel(1, backend='nccl')
 
 
 def test_adaptive_moe():
@@ -18,6 +33,11 @@ def test_adaptive_moe():
     print("=" * 80)
     print("测试动态专家激活机制")
     print("=" * 80)
+
+    # 0. 设置环境
+    print("\n[0] 初始化分布式环境...")
+    setup_environment()
+    print("✓ 分布式环境初始化成功")
 
     # 1. 创建配置
     config = OlmoeConfig(
@@ -29,9 +49,12 @@ def test_adaptive_moe():
 
     # 2. 创建OlmoeMoE层
     print("\n[1] 创建OlmoeMoE层...")
-    moe_layer = OlmoeMoE(config, prefix="test")
-    moe_layer = moe_layer.cuda()
-    moe_layer.eval()
+    # 启用专家并行
+    parallel_config = ParallelConfig(enable_expert_parallel=True)
+    with set_current_vllm_config(VllmConfig(parallel_config=parallel_config)):
+        moe_layer = OlmoeMoE(config, prefix="test")
+        moe_layer = moe_layer.cuda()
+        moe_layer.eval()
     print("✓ OlmoeMoE层创建成功")
 
     # 3. 准备测试数据
