@@ -114,14 +114,13 @@ hf download inclusionAI/LLaDA-MoE-7B-A1B-Instruct \
   --local-dir /path/to/LLaDA-MoE-7B-A1B-Instruct
 
 # Convert to FusedMoE
-python -m tools.transfer.py \
+python -m tools.transfer \
   --input  /path/to/LLaDA-MoE-7B-A1B-Instruct \
   --output /path/to/LLaDA-MoE-7B-A1B-Instruct-fused
 ```
 
 #### 2) Load the model
 
-- **Load via Auto classes:**
 ```python
 from dinfer.model import AutoModelForCausalLM
 from transformers import AutoTokenizer
@@ -134,7 +133,7 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
 
 - **Benchmark (speed only)**
   - Measure throughput (TPS) only; predictions are saved under `--output_dir` with no automatic scoring.
-  - Example 1 (LLaDA-MoE, threshold decoder, TP across 4 GPUs):
+  - Example 1 Dataset profiling (LLaDA-MoE, threshold decoder, TP across 4 GPUs):
   ```bash
   python benchmarks/benchmark_dataset.py \
     --model_name inclusionAI/LLaDA-MoE-7B-A1B-Instruct \
@@ -153,20 +152,7 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
     --warmup_times 4 \
     --cont_weight 0.3
   ```
-  - Example 2 (LLaDA-8B-Instruct, threshold decoder, TP across 4 GPUs):
-  ```bash
-  python benchmarks/benchmark.py \
-    --model_name GSAI-ML/LLaDA-8B-Instruct \
-    --model_type llada \
-    --gen_len 2048 \
-    --block_length 32 \
-    --gpu 0,1,2,3 \
-    --use_tp \
-    --parallel_decoding threshold \
-    --threshold 0.9 \
-    --cache prefix
-  ```
-  - Example 3 (LLaDA2-flash, threshold decoder, TP across 4 GPUs):
+  - Example 2 Dataset profiling (LLaDA2-flash, threshold decoder, TP across 4 GPUs):
   ```bash
     python benchmarks/benchmark_dataset.py \
       --model_name inclusionAI/LLaDA2.0-flash-preview \
@@ -182,7 +168,19 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
       --cache prefix \
       --use_bd
   ```
- 
+   - Example 3 Single-sample profiling (LLaDA-8B-Instruct, threshold decoder, TP across 4 GPUs):
+  ```bash
+  python benchmarks/benchmark.py \
+    --model_name GSAI-ML/LLaDA-8B-Instruct \
+    --model_type llada \
+    --gen_len 2048 \
+    --block_length 32 \
+    --gpu 0,1,2,3 \
+    --use_tp \
+    --parallel_decoding threshold \
+    --threshold 0.9 \
+    --cache prefix
+  ```
   - Example 4: Single-sample profiling (LLaDA2-mini, threshold decoder, TP across 4 GPUs):
   ```bash
   python benchmarks/benchmark.py \
@@ -200,7 +198,7 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
 
 
 - **Evaluation (speed + accuracy)**
-  - Built on HuggingFace `lm-eval-harness`; computes both TPS and benchmark scores.
+  - Built on HuggingFace `lm-eval-harness` to compute TPS and benchmark scores.
   - Tasks provided:
     - `gsm8k_llada`: math reasoning.
     - `mbpp_sanitized_llada`: sanitized Python code generation.
@@ -216,16 +214,16 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
 
 **Performance on HumanEval:**
 - Over 1,100 TPS at batch size 1
-- Averages 800+ TPS across six benchmarks on a single node with 8× H800 GPUs
+- Averages 800+ TPS across six benchmarks on a single node with 8×H800 GPUs
 
 **Speedup comparisons:**
 - 10× faster than Fast-dLLM while maintaining accuracy
 - 2-3× faster than Qwen2.5-3B on vLLM (LLaDA-MoE) with comparable quality
 
 ## Limitations
-- **LLaDA2**: Max 4-way TP (due to 4 attention heads)
+- **LLaDA2**: Max 4-way TP (due to 4 attention heads), LLaDA Dense/MoE models support up to 8-way TP
 - **Block Diffusion**: Not supported on LLaDA Dense/MoE models (use `--use_bd` with LLaDA2 only)
-- **Evaluation**: `lm-eval` evaluations currently configured for LLaDA-MoE only.
+- **Evaluation**: `lm-eval` evaluations currently configured for LLaDA-MoE only, will add support for LLaDA Dense/LLaDA2 in the near future.
 
 ## Contact us
 - Wechat Group
