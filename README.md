@@ -37,7 +37,8 @@ dInfer supports multiple dLLM variants, including LLaDA and LLaDA-MoE.
 - Loop unrolling mechanism to eliminate CUDA stream bubbles across diffusion iterations
 
 ## News
-**\[2025/11/15\]** Support the inference on block diffusion LLMs (LLaDA2-mini and LLaDA2-flash) and provide [the benchmark script](https://github.com/inclusionAI/dInfer/blob/master/benchmarks/benchmark_dataset_sglang.py).
+**\[2025/11/15\]** Support the inference on block diffusion LLMs (LLaDA2-mini and LLaDA2-flash).
+**\[2025/10/10\]** Release the first version of the dInfer framework.
 
 ## Contents
 - [Supported Models](#supported-models)
@@ -48,11 +49,7 @@ dInfer supports multiple dLLM variants, including LLaDA and LLaDA-MoE.
 
 dInfer supports multiple diffusion language model variants with different architectures and sizes. Below are the HuggingFace model links and their corresponding implementation files:
 
-### LLaDA2.0
-
-**Features**:
-- Sparse Mixture-of-Experts with 64 experts
-- Trained using Block Diffusion to improve throughput and stability
+### LLaDA2.0 (Mixture-of-Experts)
 
 **Implementation**: [LLaDA2MoeModelLM](python/dinfer/model/modeling_llada2_moe.py)
 
@@ -63,9 +60,6 @@ dInfer supports multiple diffusion language model variants with different archit
 
 ### LLaDA-MoE Models (Mixture-of-Experts)
 
-**Features**:
-- Sparse Mixture-of-Experts with 64 experts
-
 **Implementation**: [LLaDAMoeModelLM](python/dinfer/model/modeling_fused_olmoe.py)
 
 | Model | Size | HuggingFace Link | Description |
@@ -74,9 +68,6 @@ dInfer supports multiple diffusion language model variants with different archit
 | LLaDA-MoE-7B-A1B-Instruct | 7B | [inclusionAI/LLaDA-MoE-7B-A1B-Instruct](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Instruct) | Instruction-tuned MoE variant |
 
 ### LLaDA Models (Dense)
-
-**Features**:
-- Dense transformer architecture
 
 **Implementation**: [LLaDAModelLM](python/dinfer/model/modeling_llada.py)
 
