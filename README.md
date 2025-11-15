@@ -38,6 +38,7 @@ dInfer supports multiple dLLM variants, including LLaDA and LLaDA-MoE.
 
 ## News
 **\[2025/11/15\]** Support the inference on block diffusion LLMs (LLaDA2-mini and LLaDA2-flash).
+
 **\[2025/10/10\]** Release the first version of the dInfer framework.
 
 ## Contents
