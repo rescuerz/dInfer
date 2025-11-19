@@ -33,12 +33,17 @@ from vllm.config import VllmConfig, set_current_vllm_config, get_current_vllm_co
 from vllm.config import ParallelConfig
 from dataclasses import dataclass
 
-datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True
-datasets.config.DOWNLOAD_TIMEOUT = 180 
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+# 配置数据集加载选项
+datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True  # 允许加载需要远程代码的数据集
+datasets.config.DOWNLOAD_TIMEOUT = 180  # 下载超时时间（秒）
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # 禁用tokenizer并行化
 
 @dataclass
 class EvalConfig:
+    """
+    评估配置类，用于存储模型评估的所有参数
+    """
+    # 模型配置
     model_name: str = '/mnt/dllm/fengling/moe/workdir/7bA1b_anneal_19t_500B_further_8k_anneal_train_4k_ep3_v8p5/step45567_converted_hf_fusemoe'
     gpu: str = '0,1,2,3'
     batch_size: int = 1
@@ -75,6 +80,17 @@ def set_seed(seed):
 
 @register_model("dInfer_eval")
 class DInferEvalHarness(LM):
+    """
+    dInfer模型的lm-evaluation-harness适配器
+    
+    继承自lm_eval.api.model.LM基类，实现了：
+    - loglikelihood: 计算序列的对数似然
+    - generate_until: 生成文本直到满足停止条件
+    
+    支持两种并行模式：
+    - dp (data parallel): 数据并行，使用accelerate
+    - tp (tensor parallel): 张量并行，使用vLLM的分布式
+    """
     def __init__(
         self,
         model_path='',
@@ -83,7 +99,7 @@ class DInferEvalHarness(LM):
         eos_id=126081,
         max_length=4096,
         batch_size=1,
-        mc_num=128,
+        mc_num=128,  # Monte Carlo采样数量
         is_check_greedy=True,
         gen_length=1024,
         block_length=1024,
@@ -114,10 +130,10 @@ class DInferEvalHarness(LM):
         self.model_path = model_path
         self.mask_id = mask_id
         self.eos_id = eos_id
-        self.mc_num = mc_num
+        self.mc_num = mc_num  # Monte Carlo采样数量
         self.batch_size = int(batch_size)
         assert mc_num % self.batch_size == 0
-        self.sampling_eps = 0.
+        self.sampling_eps = 0.  # 采样epsilon（未使用）
         self.max_length = max_length
         self.is_check_greedy = is_check_greedy
         self.gen_length = gen_length
@@ -134,7 +150,7 @@ class DInferEvalHarness(LM):
         self.master_port = master_port
         self.tp_size = tp_size
         self.use_compile = use_compile
-        self.parallel = parallel
+        self.parallel = parallel  # 并行模式：'dp'或'tp'
         self.use_cudagraph = use_cudagraph
         self.gpus = gpus
         self.prefix_look = prefix_look
@@ -144,12 +160,13 @@ class DInferEvalHarness(LM):
         self.use_shift = use_shift
 
         if "moe" or "mini" in model_path:
-            self.mask_id = 156895
-            self.eos_id = 156892
+            self.mask_id = 156895  # LLaDA MoE/mini的mask ID
+            self.eos_id = 156892   # LLaDA MoE/mini的EOS ID
             self.is_moe = True
         else:
-            self.is_moe = False
+            self.is_moe = False # LLaDA非MoE模型的mask_id = 126336, eos_id = 126081
 
+        # 初始化accelerate加速器（用于数据并行）
         accelerator = accelerate.Accelerator()
         if accelerator.num_processes > 1:
             self.accelerator = accelerate.Accelerator()
@@ -164,17 +181,18 @@ class DInferEvalHarness(LM):
         
         # set decoder
         if parallel_decoding == "threshold":
-          if use_credit:
-              decoder = CreditThresholdParallelDecoder(temperature=0, threshold=threshold, mask_id=self.mask_id, eos_id=self.eos_id)
-          else:
-              decoder = ThresholdParallelDecoder(temperature=0, threshold=threshold, mask_id=self.mask_id, eos_id=self.eos_id)
+            if use_credit:
+                decoder = CreditThresholdParallelDecoder(temperature=0, threshold=threshold, mask_id=self.mask_id, eos_id=self.eos_id)
+            else:
+                decoder = ThresholdParallelDecoder(temperature=0, threshold=threshold, mask_id=self.mask_id, eos_id=self.eos_id)
         else:
             decoder = HierarchyDecoder(temperature=0, threshold=threshold, low_threshold=low_threshold,
                                       mask_id=self.mask_id, eos_id=self.eos_id)
         if parallel == 'dp':
             self.device= torch.device(device)
             if "moe" or "mini" in model_path:
-                # initialize tensor parallel but don't use it
+                # MoE或mini模型：需要初始化专家并行（EP）
+                # 注意：这里初始化TP但不实际使用，只是为了启用EP
                 os.environ['MASTER_ADDR'] = 'localhost'
                 os.environ['MASTER_PORT'] = '1234'+str(self.rank)
                 distributed.init_distributed_environment(1, 0, 'env://', 0, 'nccl')
@@ -206,7 +224,6 @@ class DInferEvalHarness(LM):
                 self.model = self.model.to(self.device)
 
             if self.use_compile:
-                # compile model
                 if self.use_cudagraph:
                     self.model.forward = torch.compile(self.model.forward, fullgraph=False, dynamic=True, mode='reduce-overhead')
                 else:
@@ -258,25 +275,38 @@ class DInferEvalHarness(LM):
         return self.tokenizer.apply_chat_template(chat_history, **kwargs)
 
     def _forward_process(self, batch, prompt_index):
+        """
+        前向扩散过程：随机mask一部分token
+        
+        通过随机mask目标序列的一部分token，然后让模型学习预测这些被mask的token
+        """
         b, l = batch.shape
 
         target_len = (l - prompt_index.sum()).item()
+        # 随机选择要mask的token数量（1， target_len）
         k = torch.randint(1, target_len + 1, (), device=batch.device)
 
+        # 为批次中的每个样本分配不同的mask数量（均匀分布）
+        # （k, k + target_len / b, k + 2*target_len / b, ..., k + (b-1)*target_len / b）
         x = torch.round(torch.linspace(float(k), k + (b - 1) * (target_len / b), steps=b, device=batch.device)).long()
         x = ((x - 1) % target_len) + 1
         assert x.min() >= 1 and x.max() <= target_len
 
+        # indices shape: (b, target_len)，is_mask shape: (b, target_len), 每行前x[i]个位置标记为True
         indices = torch.arange(target_len, device=batch.device).repeat(b, 1)
         is_mask = indices < x.unsqueeze(1)
 
+        # 随机打乱mask位置，确保mask不集中在序列开头
         for i in range(b):
             is_mask[i] = is_mask[i][torch.randperm(target_len)]
 
+        # 将提示词部分设为不mask
         is_mask = torch.cat((torch.zeros(b, prompt_index.sum(), dtype=torch.bool, device=batch.device), is_mask), dim=1)
 
+        # 应用mask
         noisy_batch = torch.where(is_mask, self.mask_id, batch)
 
+        # 返回noisy batch和mask概率
         return noisy_batch, (x / target_len).unsqueeze(1).repeat(1, l)
 
     @torch.no_grad()
@@ -291,14 +321,20 @@ class DInferEvalHarness(LM):
         logits = self.model(batch).logits
 
         if self.cfg > 0.:
+            # 应用CFG公式：logits = un_logits + (cfg + 1) * (logits - un_logits)
             logits, un_logits = torch.chunk(logits, 2, dim=0)
             logits = un_logits + (self.cfg + 1) * (logits - un_logits)
         return logits[:, :batch.shape[1]]
 
     @torch.no_grad()
     def get_loglikelihood(self, prefix, target):
+        """
+        使用Monte Carlo采样计算序列的对数似然
+        
+        通过多次随机mask和预测来估计序列的对数似然
+        """
         seq = torch.concatenate([prefix, target])[None, :]
-        seq = seq.repeat((self.batch_size, 1)).to(self.device)
+        seq = seq.repeat((self.batch_size, 1)).to(self.device) # shape: (batch_size, seq_len)
 
         prompt_index = torch.arange(seq.shape[1], device=self.device) < len(prefix)
 
@@ -310,6 +346,7 @@ class DInferEvalHarness(LM):
 
             logits = self.get_logits(perturbed_seq, prompt_index)
 
+            # 计算被mask位置的交叉熵损失
             loss = F.cross_entropy(logits[mask_indices], seq[mask_indices], reduction='none') / p_mask[mask_indices]
             loss = loss.sum() / self.batch_size
             loss_acc.append(loss.item())
@@ -318,6 +355,12 @@ class DInferEvalHarness(LM):
 
     @torch.no_grad()
     def suffix_greedy_prediction(self, prefix, target):
+        """
+        检查目标序列是否与贪婪解码结果一致
+        
+        使用贪婪解码（每次选择置信度最高的token）生成序列，
+        并检查是否与目标序列完全匹配
+        """
         if not self.is_check_greedy:
             return False
 
@@ -329,7 +372,7 @@ class DInferEvalHarness(LM):
         for i in range(len(target)):
             mask_index = (seq == self.mask_id)
             logits = self.get_logits(seq, prompt_index)[mask_index]
-            x0 = torch.argmax(logits, dim=-1)
+            x0 = torch.argmax(logits, dim=-1)  # 贪婪选择
 
             p = torch.softmax(logits.to(torch.float32), dim=-1)
             confidence = torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)).squeeze(dim=-1)
@@ -341,8 +384,13 @@ class DInferEvalHarness(LM):
         return correct
 
     def _encode_pair(self, context, continuation):
+        """
+        编码上下文和续写对，处理尾部空格
+        """
+        # 计算上下文末尾的空格数量
         n_spaces = len(context) - len(context.rstrip())
         if n_spaces > 0:
+            # 将末尾空格移到续写的开头，避免tokenization问题
             continuation = context[-n_spaces:] + continuation
             context = context[:-n_spaces]
 
@@ -355,6 +403,18 @@ class DInferEvalHarness(LM):
         return context_enc, continuation_enc
 
     def loglikelihood(self, requests):
+        """
+        计算多个请求的对数似然
+        
+        这是lm-evaluation-harness的核心接口之一，用于评估模型
+        对给定序列的预测质量
+        
+        参数:
+            requests: 请求列表，每个请求包含(context, continuation)对
+        
+        返回:
+            结果列表，每个元素为(对数似然, 是否为贪婪解码结果)
+        """
         def _tokenize(e):
             prefix, target = self._encode_pair(e["prefix"], e["target"])
             return {
@@ -371,6 +431,7 @@ class DInferEvalHarness(LM):
         ds = ds.with_format("torch")
         prompt_len = [len(x["prefix"]) + len(x["target"]) for x in ds]
 
+        # 确保序列长度不超过最大长度
         assert max(prompt_len) <= 4096
 
         out = []
@@ -379,10 +440,13 @@ class DInferEvalHarness(LM):
                 prefix = elem["prefix"]
                 target = elem["target"]
 
+                # 计算对数似然
                 ll = self.get_loglikelihood(prefix, target)
 
+                # 检查是否为贪婪解码结果
                 is_target_greedy_dec = self.suffix_greedy_prediction(prefix, target)
 
+                # 返回(对数似然, 是否贪婪)
                 out.append((ll, 1.0 if is_target_greedy_dec else 0.0))
         torch.cuda.empty_cache()
         return out
@@ -396,6 +460,8 @@ class DInferEvalHarness(LM):
             os.makedirs(self.save_dir, exist_ok=True)
             self.save_path = os.path.join(self.save_dir, f'rank_{self.rank}.jsonl')
             print(f"save_path: {self.save_path}")
+        
+        # 桶大小：用于对齐序列长度以优化CUDA图性能
         bucket_size = 32
         used_buckets = []
 
@@ -447,6 +513,7 @@ class DInferEvalHarness(LM):
 
         @ torch.no_grad()
         def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
+
             print('started', world_size, rank, gpu_id)
             torch.cuda.set_device(gpu_id)
             device = torch.device(gpu_id)
@@ -492,13 +559,11 @@ class DInferEvalHarness(LM):
                     else:
                         model.forward = torch.compile(model.forward, fullgraph=False, dynamic=True)
 
-
                 if args.parallel_decoding == 'threshold':
                     if args.use_credit:
                         decoder = CreditThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=self.mask_id, eos_id=self.eos_id)
                     else:
                         decoder = ThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=self.mask_id, eos_id=self.eos_id)
-
                 else:
                     decoder = HierarchyDecoder(temperature=0, threshold=args.threshold, low_threshold=args.low_threshold, mask_id=self.mask_id, eos_id=self.eos_id)
 
@@ -544,10 +609,12 @@ class DInferEvalHarness(LM):
                     fpss = []
                     total_token = 0
                     token_numbers = []
-                    for i in iterator:   
+                    
+                    for i in iterator:
                         input_ids = all_input_ids[i:i+args.batch_size]
                         max_length = 0
                         min_padded_length = 10000
+
                         for j, seq in enumerate(input_ids):
                             # print(j, seq.shape)
                             if seq.shape[1] > max_length:
@@ -589,7 +656,6 @@ class DInferEvalHarness(LM):
                         total_token += token_number
 
                 total_token = total_token
-
                 stop = time.time()
 
                 if rank==0:
@@ -618,7 +684,7 @@ class DInferEvalHarness(LM):
                 return 
         all_input_ids = load_inputs(requests, self.tokenizer)
         padded_gen_lens = cal_bucket_len(self.gen_length, all_input_ids)
-        
+
         answers = []
         outputs = []
         total_forward = 0
