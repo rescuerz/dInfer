@@ -557,22 +557,6 @@ class LLaDA2SparseMoeBlock(nn.Module):
         if self.num_shared_experts > 0:
             shared_output = self.shared_experts(hidden_states)
         return shared_output
-
-
-    # def _save_record(self, tensor: torch.Tensor):
-    #     """将 (layer_id, stage, tensor, info) 追加保存到共享 .npy 文件"""
-    #     if tensor is None:
-    #         return
-    #     # 转为 CPU NumPy
-    #     tensor_np = tensor.detach().float().cpu().numpy()
-    #     # 准备记录元组
-    #     record = {
-    #         'layer_id': self.layer_id,
-    #         'tensor': tensor_np,
-    #     }
-    #     # 以追加模式写入 .npy
-    #     with open(self.topk_filename, 'ab') as f:
-    #         np.save(f, record)
             
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
@@ -581,12 +565,12 @@ class LLaDA2SparseMoeBlock(nn.Module):
         # self._save_record(topk_output.topk_ids)
         return self.experts(hidden_states, topk_output)
 
+    @torch.compiler.disable
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
-        # print('current_stream:', current_stream, 'alt_stream:', self.alt_stream)
         self.alt_stream.wait_stream(current_stream)
         router_output = self._forward_router_experts(hidden_states)
 
@@ -605,13 +589,6 @@ class LLaDA2SparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
 
         DUAL_STREAM_TOKEN_THRESHOLD = 1024
-        # print('moe input', hidden_states.shape)
-        # print( self.alt_stream is not None, hidden_states.shape[0] > 0,
-        #  hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD, get_is_capture_mode(), 
-        #  self.alt_stream is not None
-        #     and hidden_states.shape[0] > 0
-        #     and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
-        #     and get_is_capture_mode())
         if (
             self.alt_stream is not None
             and hidden_states.shape[0] > 0
@@ -791,18 +768,19 @@ class LLaDA2Attention(nn.Module):
             base=config.rope_theta,
             rope_scaling=config.rope_scaling,
         )
-        # print(self.rotary_emb, self.rotary_emb.dtype)
-        # self.attn = RadixAttention(
-        #     self.num_heads,
-        #     self.head_dim,
-        #     self.scale,
-        #     num_kv_heads=self.num_kv_heads,
-        #     layer_id=layer_id,
-        #     prefix=add_prefix("attn", prefix),
-        # )
 
         self.alt_stream = alt_stream
 
+    def _apply_q_norm(self, q):
+        q_by_head = q.reshape(-1, self.head_dim)
+        q_by_head = self.query_layernorm(q_by_head)
+        return q_by_head.view(q.shape)
+    def _apply_k_norm(self, k):
+        k_by_head = k.reshape(-1, self.head_dim)
+        k_by_head = self.key_layernorm(k_by_head)
+        return k_by_head.view(k.shape)
+
+    @torch.compiler.disable(recursive=False)
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -810,20 +788,28 @@ class LLaDA2Attention(nn.Module):
         if self.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.query_layernorm(q_by_head)
+            q = self._apply_q_norm(q)
             with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.key_layernorm(k_by_head)
+                k = self._apply_k_norm(k)
             current_stream.wait_stream(self.alt_stream)
         else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.query_layernorm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.key_layernorm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
+            q = self._apply_q_norm(q)
+            k = self._apply_k_norm(k)
         return q, k
+
+    @torch.compiler.disable(recursive=False)
+    def _apply_repeat(self, k, v):
+        if self.alt_stream is not None and get_is_capture_mode():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            k = repeat_kv(k, self.num_key_value_groups)
+            with torch.cuda.stream(self.alt_stream):
+                v = repeat_kv(v, self.num_key_value_groups)
+            current_stream.wait_stream(self.alt_stream)   
+        else:
+            k = repeat_kv(k, self.num_key_value_groups)
+            v = repeat_kv(v, self.num_key_value_groups)
+        return k, v
 
     def forward(
         self,
@@ -869,19 +855,9 @@ class LLaDA2Attention(nn.Module):
             # k, v = past_key_values.update(k, v, self.layer_id, replace_position)
         if use_cache:
             present_key_values = (k, v)
-        
-        # print(3, q.shape, k.shape, v.shape)
-        
-        # q = q.transpose(1, 2)
-        # k = k.transpose(1, 2)
-        # v = v.transpose(1, 2)
-        k = repeat_kv(k, self.num_key_value_groups)
-        v = repeat_kv(v, self.num_key_value_groups)
 
-        # print(4, q.shape, k.shape, v.shape)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(q.dtype)
-        # print('attn:', q.shape, k.shape, v.shape, attention_mask.shape if attention_mask is not None else None)
+        k, v = self._apply_repeat(k, v)
+
         if attention_mask is not None:
             if len(attention_mask.shape)==3:
                 attention_mask = attention_mask.unsqueeze(1)
