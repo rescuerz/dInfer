@@ -33,6 +33,11 @@ class DiffusionLLM:
         '''
 
 def select_undecoded(seq_idx, orig_x, x, block, block_loc, mask_id, writeback=False):
+    """ 选择未完成解码的序列。
+
+    在批量解码过程中，某些序列可能比其他序列先完成解码（即不再包含mask token）。
+    此函数用于筛选出仍需解码的序列，并可选地将已完成解码的序列写回原始token数组。
+    """
     if x.batch_size == 1:
         return seq_idx, x
     bool_idx = torch.all(block != mask_id, dim=1)
@@ -91,10 +96,12 @@ class BlockRunner:
         """
         orig_x = x
         seq_idx = torch.arange(x.batch_size, device=block.device)
+        # 初始筛选未解码序列
         seq_idx, x = select_undecoded(seq_idx, orig_x, x, block, block_loc, decoder.mask_id, writeback=False)
         block = x[:, block_loc.start:block_loc.end]
         batch_size = x.batch_size
         while (block == decoder.mask_id).sum() > 0:
+            # 限制forward的次数，计算最大的forward次数
             unroll_k = int(max(min((block == decoder.mask_id).sum()//self.expected_tpf, self.maximum_unroll), 1))
             for unroll_i in range(unroll_k):
                 self.diff_iteration.forward(model, decoder, x, kv_cache, block, block_loc, block_id)
@@ -152,6 +159,7 @@ class BlockDiffusionRunner(BlockRunner):
         if kv_cache is None:
             return
         else:
+            # 执行一次前向传播以获取 KV cache
             output = model(block.clone(memory_format=torch.contiguous_format), use_cache=True, attention_mask=attn_mask, position_ids=pos_ids.clone(memory_format=torch.contiguous_format))
             if self.backend == 'vllm':
                 kv_cache.update(output.past_key_values)
@@ -193,6 +201,7 @@ class BlockDiffusionRunner(BlockRunner):
         block = x[:, block_loc.start:block_loc.end]
         batch_size = x.batch_size
 
+        # 准备 KV cache
         if kv_cache is not None:
             kv_cache.extend_cache(block_loc.end)
             past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
@@ -212,6 +221,7 @@ class BlockDiffusionRunner(BlockRunner):
                 if len(seq_idx) == 0:
                     break
         # additional forward to update kvcache for the last decoding step in the current block
+        # 额外的一次前向传播，用于更新当前块最后一步解码的 KV cache
         if kv_cache is not None:
             if input_block_mask_number > 0:
                 output = model(block.clone(memory_format=torch.contiguous_format), 
@@ -286,15 +296,20 @@ class BaseDiffusionIteration(DiffusionIteration):
             kv_cache.update(output.past_key_values)
             self.cache_updates += 1
 
+        # 根据 KV cache 的状态和类型执行不同的前向传播逻辑
         if kv_cache is None:
+            # 如果没有 KV cache，直接对整个输入进行前向传播
             logits = model(x.data).logits[:, block_loc.start:block_loc.end]
         elif kv_cache.cache_type == 'prefix':
+            # 如果是前缀缓存，获取对应的 KV cache 和替换位置
             past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
+            # 仅对当前块及其后续部分进行前向传播
             logits = model(x[:, block_loc.start:], past_key_values=past_key_values, use_cache=True,
                     replace_position=replace_position).logits
             block_length = block_loc.end - block_loc.start
             logits = logits[:, :block_length]
         else:
+            # 其他类型的缓存（如双向缓存）
             past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
             # cache position is the position between current_block_start and current_block_end
             logits = model(block, past_key_values=past_key_values, use_cache=True,
@@ -394,6 +409,7 @@ class ShiftDiffusionIteration(DiffusionIteration):
         block_id : int
             The block ID
         """
+        # 计算移位后的块起始和结束位置
         block_start, block_end = block_loc.start-1, block_loc.end-1
         # Update KV-cache
         if kv_cache is not None and kv_cache.require_update(self.iter_no, block_start, block_end):
@@ -401,13 +417,17 @@ class ShiftDiffusionIteration(DiffusionIteration):
             self.num_forwards += 1
             # use the generated output to decode.
             # TODO(dulun): need to improve efficiency
+            # 创建移位后的 TokenArray
             x_shifted = TokenArray(x.data[:, 1:], 0, decoder.mask_id, decoder.eos_id, model.device)
+            # 使用生成的 logits 解码移位后的 TokenArray
             decoder.decode(output.logits[:, block_start:block_end], block_start, block_end, x_shifted)
+            # 将解码结果写回原始 TokenArray
             x.data[:, 1:] = x_shifted.data
             # update KV-cache
             kv_cache.update(output.past_key_values)
             self.cache_updates += 1
 
+        # 根据 KV cache 的状态和类型执行不同的前向传播逻辑
         if kv_cache is None:
             logits = model(x.data).logits[:, block_start:block_end]
         elif kv_cache.cache_type == 'prefix':
@@ -422,6 +442,7 @@ class ShiftDiffusionIteration(DiffusionIteration):
             logits = model(x[:, block_start:block_end], past_key_values=past_key_values, use_cache=True,
                     replace_position=replace_position).logits
         # TODO(dulun): need to improve efficiency
+        # 再次创建移位后的 TokenArray 并解码
         x_shifted = TokenArray(x.data[:, 1:], 0, decoder.mask_id, decoder.eos_id, model.device)
         decoder.decode(logits, block_start, block_end, x_shifted)
         x.data[:, 1:] = x_shifted.data
@@ -454,10 +475,12 @@ class BlockWiseDiffusionLLM(DiffusionLLM):
         self.cache_factory = cache_factory
         self.decoder = decoder
         self.iterator_factory = iterator_factory
+        # 根据是否使用移位选择不同的扩散迭代实现
         if use_shift:
             self.diff_iteration = ShiftDiffusionIteration()
         else:
             self.diff_iteration = BaseDiffusionIteration()
+        # 初始化块解码器
         self.block_decoder = BlockRunner(self.diff_iteration, early_stop, maximum_unroll, expected_tpf)
         
 
@@ -473,16 +496,23 @@ class BlockWiseDiffusionLLM(DiffusionLLM):
     def generate(self, prompt, gen_length=128, block_length=128):
         ''' Generate tokens with diffusion iterations block by block.
         '''
+        # 初始化 TokenArray
         x = TokenArray(prompt, gen_length, self.decoder.mask_id, self.decoder.eos_id, self.model.device)
+        # 创建迭代器
         it = self.iterator_factory.create(x, block_length)
 
         # We need to reset iter_no at the beginning of generating a sequence.
+        # 重置迭代计数器
         self.diff_iteration.iter_no = 0
+        # 创建 KV cache
         kv_cache = self.cache_factory.create() if self.cache_factory is not None else None
+        # 遍历每个块进行解码
         for block_id, (block_loc, block) in enumerate(it):
             self.decoder.block_init(block, block_id)
+            # 解码当前块
             decode_compl = self.block_decoder.decode(self.model, self.decoder, x, kv_cache, block, block_loc, block_id)
             # If all sequences have EOS, we have finished decoding.
+            # 如果所有序列都已完成解码，退出循环
             if torch.all(decode_compl):
                 break
         logger.info(f'The number of diffusion iterations: {self.num_forwards}')
