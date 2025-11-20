@@ -105,7 +105,7 @@ def init_generator(model, sample_params, backend='vllm', max_length=4096):
                     early_stop=sample_params.early_stop)
     else:
         dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), 
-            cache_factory=cache_factory, early_stop=sample_params.early_stop, maximum_unroll=4, expected_tpf=4, backend=backend)
+            cache_factory=cache_factory, early_stop=sample_params.early_stop, maximum_unroll=2, expected_tpf=15, backend=backend)
 
     return dllm
 
@@ -117,6 +117,7 @@ def generate(dllm, device, req_q, res_q):
             break
         else:
             input_ids, gen_len, block_len = data
+        input_ids = input_ids.to(device)
         out = dllm.generate(input_ids, gen_length=gen_len, block_length=block_len)
         num_forwards = dllm.num_forwards
         if res_q is not None:

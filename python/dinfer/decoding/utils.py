@@ -458,9 +458,12 @@ class DiffusionKVCacheManager:
             self.past_key_values = past_key_values
         else:
             if block_length>0:
-                self.past_key_values = KVCache([torch.cat((kv[:, :, range_start:range_end-block_length], kv[:, :, -block_length:]), dim=2) for kv in past_key_values], self.backend)
+                num_layers = len(past_key_values) // 2
+                inner_shape = past_key_values[0].shape
+                compact_kvcache = torch.stack(past_key_values, dim=0).reshape(num_layers, 2, *inner_shape)
+                self.past_key_values = KVCache(torch.cat((compact_kvcache[:, :, :, :, range_start:range_end-block_length], compact_kvcache[:, :, :, :, -block_length:]), dim=4), self.backend, self.max_length)
             else:
-                self.past_key_values = KVCache([kv[:, :, range_start:range_end] for kv in past_key_values], self.backend)
+                self.past_key_values = KVCache([kv[:, :, range_start:range_end] for kv in past_key_values], self.backend, self.max_length)
         # We should make sure the kv-cache in all layers are converted into a tensor.
         self.past_key_values.consolidate()
         # print(self.past_key_values._data.shape)
