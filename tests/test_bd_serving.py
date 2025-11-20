@@ -94,6 +94,7 @@ def init_sglang_dist():
   max_length = 2048
   model = ModelRunner(model, device, server_args=server_args, max_length=max_length)
   return model
+model = init_sglang_dist()
 
 def run_bd(use_kvcache):
   with open(sample_path, "r") as f:
@@ -131,6 +132,7 @@ def run_bd_serving(use_kvcache):
             after_look=0, warmup_steps=0, enable_torch_compile=True, mask_id=156895, eos_id=156892, parallel_decoding='threshold', 
             use_credit=False, use_bd=True, max_length=2048)
     dllm_server = DiffusionLLMServing(model_path, model_type='llada2-mini', sample_params=sample_params, server_port=40567, num_gpus=1, dp_size=1, tpep_size=1, backend='sglang')
+
 
     ans = []
     for sample in samples:
@@ -191,5 +193,6 @@ def test_bd():
   
 if __name__ == '__main__':
   # ans = run_bd_serving(use_kvcache=True) # using serving to generate response.
-  # model = init_sglang_dist() # test the init of sglang model.
-  ans = run_bd_serving_error(use_kvcache=True) # with code with error capture. When timeout, the process will return runtime error.
+  model = init_sglang_dist() # test the init of sglang model.
+  test_bd()
+  # ans = run_bd_serving_error(use_kvcache=True) # with code with error capture. When timeout, the process will return runtime error.

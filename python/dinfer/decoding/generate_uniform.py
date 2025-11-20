@@ -939,7 +939,7 @@ class BlockDiffusionLLM(DiffusionLLM):
         new_gen_length=total_length-prompt_length
 
         # prepare block_mask and position IDs
-        block_mask = torch.tril(torch.ones(num_blocks, num_blocks, device=self.model.device))
+        block_mask = torch.tril(torch.ones(num_blocks, num_blocks, device=self.model.device, dtype=torch.bool))
         bd_attn_mask = block_mask.repeat_interleave(block_length, dim=0)\
                                         .repeat_interleave(block_length, dim=1).unsqueeze(0).repeat(batch_size, 1, 1)
         pos_ids = torch.arange(total_length, device=self.model.device).unsqueeze(0).repeat(batch_size, 1)

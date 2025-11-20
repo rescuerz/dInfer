@@ -200,6 +200,8 @@ class ModelRunner:
         use_cache: Optional[bool] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
+        if attention_mask is not None:
+            attention_mask = attention_mask.bool()
         if isinstance(past_key_values, KVCache):
             past_key_values = past_key_values._data
         
