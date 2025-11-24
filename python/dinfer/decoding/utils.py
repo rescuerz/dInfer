@@ -285,7 +285,7 @@ class KVCache:
     past_key_values : List[torch.Tensor]
         The keys and values of each transformer layer.
     """
-    def __init__(self, past_key_values, backend='vllm', length=2048, cache_align_size=256):
+    def __init__(self, past_key_values, backend='vllm', length=2048, cache_align_size=128):
         if backend == 'vllm':
             assert len(past_key_values) % 2 == 0
             self._data = past_key_values
@@ -294,7 +294,11 @@ class KVCache:
             assert len(past_key_values) % 2 == 0
             self._raw_data = past_key_values
             self._consolidate_raw()
-            self.length = max((self._raw_data.shape[4]+64+self.cache_align_size-1)//self.cache_align_size*self.cache_align_size, length)
+
+            n = -(-(self._raw_data.shape[4] + 64) // self.cache_align_size)
+            next_pow2 = 1 << (n - 1).bit_length() if n > 1 else 1
+            self.length = next_pow2 * self.cache_align_size
+
             device = self._raw_data.device
             num_layer, _, batch_size, num_heads, seq_len, hidden_dim = self._raw_data.shape
             self._data = torch.zeros(num_layer, 2, batch_size, num_heads, self.length, hidden_dim, device=device, dtype=torch.bfloat16)
@@ -457,13 +461,13 @@ class DiffusionKVCacheManager:
             # raise ValueError("past_key_values should be a list of tensors")
             self.past_key_values = past_key_values
         else:
+            num_layers = len(past_key_values) // 2
+            inner_shape = past_key_values[0].shape
+            compact_kvcache = torch.stack(past_key_values, dim=0).reshape(num_layers, 2, *inner_shape)
             if block_length>0:
-                num_layers = len(past_key_values) // 2
-                inner_shape = past_key_values[0].shape
-                compact_kvcache = torch.stack(past_key_values, dim=0).reshape(num_layers, 2, *inner_shape)
                 self.past_key_values = KVCache(torch.cat((compact_kvcache[:, :, :, :, range_start:range_end-block_length], compact_kvcache[:, :, :, :, -block_length:]), dim=4), self.backend, self.max_length)
             else:
-                self.past_key_values = KVCache([kv[:, :, range_start:range_end] for kv in past_key_values], self.backend, self.max_length)
+                self.past_key_values = KVCache(compact_kvcache[:, :, :, :, range_start:range_end], self.backend, self.max_length)
         # We should make sure the kv-cache in all layers are converted into a tensor.
         self.past_key_values.consolidate()
         # print(self.past_key_values._data.shape)
@@ -516,7 +520,10 @@ class BlockDiffusionPrefixCacheManager(DiffusionKVCacheManager):
             self.past_key_values._data = extended_cache
         else:
             cur_kv_length = self.past_key_values._data.shape[-2]
-            aligned_end = (end+self.past_key_values.cache_align_size-1)//self.past_key_values.cache_align_size*self.past_key_values.cache_align_size
+            n = -(-end // self.past_key_values.cache_align_size)  # 等价于 ceil(target / cache_align_size)，纯整数
+            next_pow2 = 1 << (n - 1).bit_length() if n > 1 else 1
+            aligned_end = next_pow2 * self.past_key_values.cache_align_size
+
             if aligned_end <= cur_kv_length:
                 return
             extended_cache = F.pad(self.past_key_values._data, pad=(0, 0, 0, aligned_end-cur_kv_length), mode='constant', value=0)

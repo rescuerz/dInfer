@@ -968,19 +968,14 @@ class BlockDiffusionLLM(DiffusionLLM):
         total_length = num_blocks * block_length
         new_gen_length=total_length-prompt_length
         
-        assert self.cache_factory.max_length >= (prompt_length + gen_length)
-        attn_mask_num_blocks = self.cache_factory.max_length // block_length
+        mask_length = (max(self.cache_factory.max_length, prompt_length + gen_length)+block_length-1)//block_length*block_length
+        attn_mask_num_blocks = mask_length // block_length
 
         # prepare block_mask and position IDs
         block_mask = torch.tril(torch.ones(attn_mask_num_blocks, attn_mask_num_blocks, device=self.model.device, dtype=torch.bool))
         bd_attn_mask = block_mask.repeat_interleave(block_length, dim=0)\
                                         .repeat_interleave(block_length, dim=1).unsqueeze(0).repeat(batch_size, 1, 1)
         pos_ids = torch.arange(total_length, device=self.model.device).unsqueeze(0).repeat(batch_size, 1)
-        # attention mask for sglang backend, it is fixed because cache has fixed total length, 
-        # attention mask for vllm backend is dynamic and generated in the block loop because cache has variable total length
-        if self.backend == 'sglang':
-            cross_block_attn_mask = torch.ones(batch_size, 2*block_length, self.cache_factory.max_length, device=self.model.device, dtype=torch.bool)
-            cross_block_attn_mask[:, :block_length, -block_length:].fill_(False)
 
         x = TokenArray(prompt, new_gen_length, self.decoder.mask_id, self.decoder.eos_id, self.model.device)
         it = self.iterator_factory.create(x, block_length)
@@ -999,6 +994,9 @@ class BlockDiffusionLLM(DiffusionLLM):
             self.decoder.block_init(block, block_id)
             if self.backend == 'vllm':
                 cross_block_attn_mask = bd_attn_mask[:,block_loc.start-block_length:block_loc.end, :block_loc.end]
+            else:
+                cross_block_attn_mask = torch.ones(batch_size, 2*block_length, kv_cache.past_key_values._data.shape[4], device=prompt.device, dtype=torch.bool)
+                cross_block_attn_mask[:, :block_length, -block_length:].fill_(False)
             decode_compl = self.block_runner.decode(self.model, self.decoder, x, kv_cache, block, block_loc, block_id, pos_ids, bd_attn_mask, block_length, cross_block_attn_mask)
             if torch.all(decode_compl) and self.early_stop:
                 break

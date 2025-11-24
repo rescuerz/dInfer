@@ -149,7 +149,9 @@ def main(world_size, rank, gpu_id, args):
     model.after_processing()    # if model is quantized, use quant_method.process_weights_after_loading
     input_lengths = [inp.size(-1) for inp in all_input_ids]
     max_length = max(input_lengths)+args.gen_len
-    model = ModelRunner(model, device, server_args=server_args, max_length=max_length)
+    aligned_lengths = np.unique([length//args.block_length*args.block_length for length in input_lengths])
+    aligned_lengths = [int(length) for length in aligned_lengths]
+    model = ModelRunner(model, device, server_args=server_args, max_length=max_length, prefill_lengths=aligned_lengths, enable_cuda_graph=True, supported_batch_sizes=[args.batch_size])
 
 
     if args.parallel_decoding == 'threshold':
@@ -181,7 +183,9 @@ def main(world_size, rank, gpu_id, args):
                 dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=args.use_shift)
     else:
         dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=cache_factory, early_stop=True, maximum_unroll=2, expected_tpf=15, backend='sglang')
-
+    # warmup for decoding algorithms
+    input_ids = torch.arange(64, dtype=torch.long, device=device).unsqueeze(0)
+    dllm.generate(input_ids, gen_length=args.gen_len, block_length=args.block_length)
     batch_size = args.batch_size
     
 

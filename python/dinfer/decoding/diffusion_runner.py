@@ -29,6 +29,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     set_dp_buffer_len,
 )
+import math
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
@@ -53,8 +54,6 @@ def freeze_gc(enable_cudagraph_gc: bool):
         if should_freeze:
             gc.unfreeze()
             gc.collect()
-
-    
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
@@ -126,7 +125,8 @@ def set_global_graph_memory_pool(val):
 
 
 class ModelRunner:
-    def __init__(self, model: torch.nn.Module, device: str = "cuda", enable_cuda_graph: bool = True, supported_batch_sizes: Optional[list] = None, server_args=None, max_length=2048, block_length=32, prefill_lengths=[64, 96, 128], decoding_lengths=[32], enable_compile=True):
+    def __init__(self, model: torch.nn.Module, device: str = "cuda", enable_cuda_graph: bool = True, supported_batch_sizes: Optional[list] = None, server_args=None,
+            max_length=2048, block_length=32, prefill_lengths=[64, 96, 128], decoding_lengths=[32], enable_compile=True, cache_lengths=None):
         self.model = model.to(device)
         device = str(device)
         self.server_args = server_args
@@ -139,24 +139,26 @@ class ModelRunner:
         self.enable_compile = enable_compile
         self.enable_cuda_graph = enable_cuda_graph and (device != "cpu") # CPU 模式下禁用
         self.supported_batch_sizes = supported_batch_sizes or [1, ] # 默认支持的 batch sizes
-        self.max_length = max_length
+        if cache_lengths is None:
+            self.max_length = max_length
+            n = int(math.log2(self.max_length // 128)) + 2
+            cache_lengths = [128 * 2**i for i in range(n)]
+        self.max_length = max(max_length, max(cache_lengths))
+
         self.block_length = block_length
         self.prefill_lengths=prefill_lengths
         self.decoding_lengths = decoding_lengths
+        self.cache_lengths = cache_lengths
         if block_length not in decoding_lengths:
             self.decoding_lengths.append(block_length)
-        self.enable_compile = enable_compile
         # 设置模型为评估模式
         x = torch.arange(block_length, dtype=torch.long, device=device).unsqueeze(0)
         
         self.model.eval()
         self.tp_group = get_tp_group()
-        # self.cuda_graph_runners = {}
         set_custom_all_reduce(True)
 
-        # _to_torch(self.model, reverse=True, num_tokens=1024)
         self.forward_normal(x, use_cache=True)
-        # self.tp_group.ca_comm = backup_ca_comm
         self.init_device_graphs()
         
 
@@ -191,7 +193,11 @@ class ModelRunner:
         attention_mask: Optional[torch.Tensor] = None,
     ):
         backup_ca_comm = self.tp_group.ca_comm
-        _to_torch(self.model, reverse=False, num_tokens=input_ids.numel())
+        if attention_mask is not None and past_key_values is not None:
+            attention_mask_partial = torch.zeros((attention_mask.shape[0], attention_mask.shape[1], 
+                        past_key_values.shape[4]), dtype=torch.bool, device=attention_mask.device)
+            attention_mask_partial[:, :, :attention_mask.shape[2]] = attention_mask
+            attention_mask = attention_mask_partial
         ret = self.model.forward(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -224,21 +230,29 @@ class ModelRunner:
         
         is_decode_phase = input_ids is not None and use_cache==True and past_key_values is not None
         length = input_ids.shape[1]
+        if past_key_values is not None:
+            cache_length = past_key_values.shape[4]
+        else:
+            cache_length = 0
+
         can_run_graph = bool(
             self.graph_runner
-            and self.graph_runner.can_run(input_ids, position_ids, past_key_values, is_decode_phase, length)
+            and self.graph_runner.can_run(input_ids, position_ids, past_key_values, is_decode_phase, length, cache_length)
         )
         if can_run_graph and self.enable_cuda_graph:
+            logger.debug('run cuda graph')
             ret = self.graph_runner.replay(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 is_decode_phase=is_decode_phase,
-                attention_mask=attention_mask,
                 length=length,
+                attention_mask=attention_mask,
+                cache_length=cache_length,
             )
             return ret
 
+        logger.debug('run normal')
         ret = self.forward_normal(input_ids, position_ids, inputs_embeds, pp_proxy_tensors, past_key_values, replace_position, use_cache, attention_mask)
         return ret
     
@@ -256,12 +270,12 @@ class CudaGraphRunner:
         self.graphs = {}
         self.output_buffers = {}
         self.disable_padding = True
-        self.enable_compile = model_runner.enable_compile
 
         self.max_bs = max(self.capture_bs)
         self.seq_len_fill_value = 0
         self.num_tokens_per_bs = self.model_runner.block_length
         self.prefill_lengths = model_runner.prefill_lengths
+        self.cache_lengths = model_runner.cache_lengths
         self.decoding_lengths = model_runner.decoding_lengths
         self.max_num_token = self.max_bs * max(self.num_tokens_per_bs, max(self.prefill_lengths))
         self.tp_size = get_attention_tp_size()
@@ -309,84 +323,24 @@ class CudaGraphRunner:
                 empty_cache=False,
             )
             # Reverse the order to enable better memory sharing across cuda graphs.
-            capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_bs)))
+            capture_cache_length_range = (
+                tqdm.tqdm(list(reversed(self.cache_lengths)))
                 if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_bs)
+                else reversed(self.cache_lengths)
             )
-            for bs in capture_range:
-                length = self.model_runner.block_length
-                if get_tensor_model_parallel_rank() == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.model_runner.device,
-                        self.model_runner.gpu_id,
-                        empty_cache=False,
-                    )
-                    capture_range.set_description(
-                        f"Capturing batches ({bs=} {length=} {avail_mem=:.2f} GB)"
-                    )
-
-                with patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs and self.enable_compile,
-                    num_tokens=bs * length,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward, True, length)
-                    self.graphs[(bs, True, length)] = graph
-                    self.output_buffers[(bs, True, length)] = output_buffers
-
-                # Save gemlite cache after each capture
-                save_gemlite_cache()
-
-                length = self.model_runner.block_length*2
-                if get_tensor_model_parallel_rank() == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.model_runner.device,
-                        self.model_runner.gpu_id,
-                        empty_cache=False,
-                    )
-                    capture_range.set_description(
-                        f"Capturing batches ({bs=} {length=} {avail_mem=:.2f} GB)"
-                    )
-
-                with patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs and self.enable_compile,
-                    num_tokens=bs * length,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward, True, length, use_mask = True)
-                    self.graphs[(bs, True, length)] = graph
-                    self.output_buffers[(bs, True, length)] = output_buffers
-
-                # Save gemlite cache after each capture
-                save_gemlite_cache()
-            print('finished capturing decode')
-
-            capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_bs)))
-                if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_bs)
-            )
-            for bs in capture_range:
-                for length in self.prefill_lengths:
-                    # print(bs, length)
+            for bs in reversed(self.capture_bs):
+                for cache_length in capture_cache_length_range:
+                    length = self.model_runner.block_length
                     if get_tensor_model_parallel_rank() == 0:
                         avail_mem = get_available_gpu_memory(
                             self.model_runner.device,
                             self.model_runner.gpu_id,
                             empty_cache=False,
                         )
-                        capture_range.set_description(
-                            f"Capturing prefilling batches ({bs=} {length=} {avail_mem=:.2f} GB)"
-                            )
+                        capture_cache_length_range.set_description(
+                            f"Capturing batches ({bs=} {length=} {cache_length=} {avail_mem=:.2f} GB)"
+                        )
+
                     with patch_model(
                         self.model_runner.model,
                         bs in self.compile_bs and self.enable_compile,
@@ -396,15 +350,75 @@ class CudaGraphRunner:
                         (
                             graph,
                             output_buffers,
-                        ) = self.capture_one_batch_size(bs, forward, False, length)
-                        self.graphs[(bs, False, length)] = graph
-                        self.output_buffers[(bs, False, length)] = output_buffers
+                        ) = self.capture_one_batch_size(bs, forward, True, length, cache_length)
+                        self.graphs[(bs, True, length, cache_length)] = graph
+                        self.output_buffers[(bs, True, length, cache_length)] = output_buffers
 
                     # Save gemlite cache after each capture
                     save_gemlite_cache()
 
+                    length = self.model_runner.block_length*2
+                    if get_tensor_model_parallel_rank() == 0:
+                        avail_mem = get_available_gpu_memory(
+                            self.model_runner.device,
+                            self.model_runner.gpu_id,
+                            empty_cache=False,
+                        )
+                        capture_cache_length_range.set_description(
+                            f"Capturing batches ({bs=} {length=} {cache_length=} {avail_mem=:.2f} GB)"
+                        )
 
-    def capture_one_batch_size(self, bs: int, forward: Callable, is_decode_phase:bool=True, length:int=0, use_mask:bool=False):
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs and self.enable_compile,
+                        num_tokens=bs * length,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(bs, forward, True, length, cache_length, use_mask = True)
+                        self.graphs[(bs, True, length, cache_length)] = graph
+                        self.output_buffers[(bs, True, length, cache_length)] = output_buffers
+
+                    # Save gemlite cache after each capture
+                    save_gemlite_cache()
+            print('finished capturing decode')
+
+            capture_prefilling_range = (
+                tqdm.tqdm(list(self.prefill_lengths))
+                if get_tensor_model_parallel_rank() == 0
+                else self.prefill_lengths
+            )
+            for bs in reversed(self.capture_bs):
+                for length in capture_prefilling_range:
+                    # print(bs, length)
+                    if get_tensor_model_parallel_rank() == 0:
+                        avail_mem = get_available_gpu_memory(
+                            self.model_runner.device,
+                            self.model_runner.gpu_id,
+                            empty_cache=False,
+                        )
+                        capture_prefilling_range.set_description(
+                            f"Capturing prefilling batches ({bs=} {length=} {avail_mem=:.2f} GB)"
+                            )
+                    with patch_model(
+                        self.model_runner.model,
+                        False,
+                        num_tokens=bs * length,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(bs, forward, False, length)
+                        self.graphs[(bs, False, length, 0)] = graph
+                        self.output_buffers[(bs, False, length, 0)] = output_buffers
+
+                    # Save gemlite cache after each capture
+                    save_gemlite_cache()
+
+    def capture_one_batch_size(self, bs: int, forward: Callable, is_decode_phase:bool=True, length:int=0, cache_length:int=0, use_mask:bool=False):
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens_per_bs = length
@@ -415,15 +429,19 @@ class CudaGraphRunner:
         position_ids = self.position_ids[:num_tokens].view(bs, num_tokens_per_bs)
         # print(input_ids.shape)
         if is_decode_phase:
-            past_key_values = self.past_key_values[:, :, :bs]
+            past_key_values = self.past_key_values[:, :, :bs, :, :cache_length]
         else:
             past_key_values=None
         
         attn_mask=None
         if use_mask:
-            attn_mask = self.attention_mask[:bs, :num_tokens_per_bs]
-        if not is_decode_phase:
-            attn_mask = self.attention_mask[:bs, :num_tokens_per_bs, :num_tokens_per_bs]
+            if not is_decode_phase:
+                attn_mask = self.attention_mask[:bs, :num_tokens_per_bs, :num_tokens_per_bs]
+            else:
+                attn_mask = self.attention_mask[:bs, :num_tokens_per_bs, :cache_length]
+
+
+
 
         # Run and capture
         def run_once():
@@ -455,13 +473,15 @@ class CudaGraphRunner:
 
         return graph, out
 
-    def can_run(self, input_ids, position_ids, past_key_values, is_decode_phase=True, length=0):
+    def can_run(self, input_ids, position_ids, past_key_values, is_decode_phase=True, length=0, cache_length=0):
         cuda_graph_bs = input_ids.shape[0]
-        is_bs_supported = (cuda_graph_bs, is_decode_phase, length) in self.graphs.keys()
+        is_bs_supported = (cuda_graph_bs, is_decode_phase, length, cache_length) in self.graphs.keys()
+        if is_bs_supported == False:
+            logger.debug('not supported', cuda_graph_bs, is_decode_phase, length, cache_length, self.graphs.keys())
         return is_bs_supported
 
 
-    def replay_prepare(self, input_ids, position_ids, past_key_values, is_decode_phase, length, attention_mask):
+    def replay_prepare(self, input_ids, position_ids, past_key_values, is_decode_phase, length, attention_mask, cache_length):
         raw_bs = input_ids.shape[0]
         raw_num_token = raw_bs * length
 
@@ -473,7 +493,7 @@ class CudaGraphRunner:
         self.input_ids[:raw_num_token].copy_(input_ids.flatten())
         self.position_ids[:raw_num_token].copy_(position_ids.flatten())
         if is_decode_phase:
-            minimal_length = min(self.past_key_values.shape[4], past_key_values.shape[4])
+            minimal_length = min(self.past_key_values.shape[4], past_key_values.shape[4], cache_length)
             self.past_key_values[:, :, :bs, :, minimal_length:].fill_(0)
             self.past_key_values[:, :, :bs, :, :minimal_length].copy_(past_key_values[:, :, :, :, :minimal_length])
         if attention_mask is not None:
@@ -487,12 +507,12 @@ class CudaGraphRunner:
 
 
     def replay(
-        self, input_ids, position_ids, past_key_values, is_decode_phase, length, attention_mask
+        self, input_ids, position_ids, past_key_values, is_decode_phase, length, attention_mask, cache_length
     ):
-        self.replay_prepare(input_ids, position_ids, past_key_values, is_decode_phase, length, attention_mask)
+        self.replay_prepare(input_ids, position_ids, past_key_values, is_decode_phase, length, attention_mask, cache_length)
 
         # Replay
-        self.graphs[(self.bs, is_decode_phase, length)].replay()
+        self.graphs[(self.bs, is_decode_phase, length, cache_length)].replay()
 
-        output = self.output_buffers[(self.bs, is_decode_phase, length)]
+        output = self.output_buffers[(self.bs, is_decode_phase, length, cache_length)]
         return output

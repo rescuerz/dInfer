@@ -863,11 +863,13 @@ class LLaDA2Attention(nn.Module):
         if attention_mask is not None:
             if len(attention_mask.shape)==3:
                 attention_mask = attention_mask.unsqueeze(1)
-        key_padding_mask = (k.abs().sum(1, keepdim=True).sum(-1)>0.00001).unsqueeze(2).repeat(1, 1, q.shape[2], 1)
-        if attention_mask is not None:
-            attention_mask = attention_mask & key_padding_mask
-        else:
-            attention_mask = key_padding_mask
+        # This code is used to eliminate the impact of cache padding, but with vary cache length, the impact is 
+        # limited and has little drop in score. We leave it here for potential future use if there is accuracy issue
+        # key_padding_mask = (k.abs().sum(1, keepdim=True).sum(-1)>0.00001).unsqueeze(2).repeat(1, 1, q.shape[2], 1)
+        # if attention_mask is not None:
+        #     attention_mask = attention_mask & key_padding_mask
+        # else:
+        #     attention_mask = key_padding_mask
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
