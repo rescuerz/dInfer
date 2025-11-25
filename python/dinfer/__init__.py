@@ -13,7 +13,11 @@ __version__ = "0.1"
 
 from .decoding.parallel_strategy import ThresholdParallelDecoder,CreditThresholdParallelDecoder,HierarchyDecoder, MCMCThresholdParallelDecoder
 
-from .decoding.generate_uniform import DiffusionLLM, BlockWiseDiffusionLLM, VicinityCacheDiffusionLLM, BlockWiseDiffusionLLMWithSP, BlockDiffusionLLMAttnmask, BlockDiffusionLLM, BlockMCMCDiffusionLLM
+from .decoding.generate_uniform import (
+    DiffusionLLM, BlockWiseDiffusionLLM, VicinityCacheDiffusionLLM, BlockWiseDiffusionLLMWithSP, 
+    BlockDiffusionLLMAttnmask, BlockDiffusionLLM, BlockMCMCDiffusionLLM, 
+    MCMCDiffusionIteration, MCMCBlockRunner, MCMCProposalGenerator, MCMCRefinementRunner
+)
 from .decoding.generate_uniform import IterSmoothDiffusionLLM, IterSmoothWithVicinityCacheDiffusionLLM
 
 from .decoding.serving import DiffusionLLMServing, SamplingParams

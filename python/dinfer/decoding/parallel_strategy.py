@@ -325,6 +325,9 @@ class ThresholdParallelDecoder(ParallelDecoder):
 
 class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
     """MCMC专用的阈值解码器，返回置信度以支持Power Sampling"""
+    
+    # 调试开关
+    DEBUG_MCMC_DECODER = False
 
     def decode(self, logits, block_start, block_end, x, mcmc_alpha=1.0, iter_threshold=None):
         """解码并返回双重置信度
@@ -339,12 +342,18 @@ class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
         mask_index = (x[:, block_start:block_end] == self.mask_id)
         assert mask_index.shape[1] == logits.shape[1]
         curr_x = x[:, block_start:block_end]
+        
+        # DEBUG: 记录 mask 数量
+        num_masks_before = mask_index.sum().item()
 
         # 调用 get_transfer_index_threshold 获取 x0 和 transfer_index
-        x0, transfer_index = get_transfer_index_threshold(
+        x0, transfer_index_raw = get_transfer_index_threshold(
             logits, self.temperature, mask_index, curr_x,
             self.mask_id, threshold=iter_threshold, use_float64=self.use_float64
         )
+        
+        # DEBUG: 记录 transfer_index 数量（在 AND mask_index 之前）
+        num_transfer_raw = transfer_index_raw.sum().item()
 
         # 计算双重置信度
         log_p_norm = F.log_softmax(logits, dim=-1)
@@ -353,17 +362,34 @@ class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
         x0_logp_norm = torch.gather(log_p_norm, -1, x0.unsqueeze(-1)).squeeze(-1)
         x0_logp_unnorm = torch.gather(log_p_unnorm, -1, x0.unsqueeze(-1)).squeeze(-1)
 
-        # 只在 transfer_index 位置保存置信度
+        # 只在 transfer_index_raw 位置保存置信度（这是关键！）
+        # 注意：这里使用 transfer_index_raw，而不是 AND mask_index 之后的结果
         confidences_norm = torch.full_like(x0, -np.inf, dtype=torch.float32)
         confidences_unnorm = torch.full_like(x0, -np.inf, dtype=torch.float32)
 
-        confidences_norm[transfer_index] = x0_logp_norm[transfer_index].float()
-        confidences_unnorm[transfer_index] = x0_logp_unnorm[transfer_index].float()
+        confidences_norm[transfer_index_raw] = x0_logp_norm[transfer_index_raw].float()
+        confidences_unnorm[transfer_index_raw] = x0_logp_unnorm[transfer_index_raw].float()
+        
+        # DEBUG: 记录置信度更新数量
+        num_conf_updated = (confidences_norm > -np.inf).sum().item()
 
-        # 更新 x
-        transfer_index = torch.logical_and(transfer_index, mask_index)
+        # 更新 x（只在 mask 位置更新）
+        transfer_index = torch.logical_and(transfer_index_raw, mask_index)
         assert transfer_index.dtype == torch.bool
         x[:, block_start:block_end] = torch.where(transfer_index, x0, curr_x)
+        
+        # DEBUG: 记录实际转移数量
+        num_transfer_final = transfer_index.sum().item()
+        
+        # DEBUG: 检查更新后的 mask 数量
+        mask_index_after = (x[:, block_start:block_end] == self.mask_id)
+        num_masks_after = mask_index_after.sum().item()
+        
+        if self.DEBUG_MCMC_DECODER:
+            print(f"[MCMCDecoder] block=[{block_start},{block_end}), "
+                  f"masks: {num_masks_before}->{num_masks_after}, "
+                  f"transfer_raw={num_transfer_raw}, transfer_final={num_transfer_final}, "
+                  f"conf_updated={num_conf_updated}")
 
         return confidences_norm, confidences_unnorm
 
