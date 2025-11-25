@@ -1,11 +1,12 @@
 import torch
 import numpy as np
 import logging
+import random
 
 from transformers.models.layoutlmv2.modeling_layoutlmv2 import relative_position_bucket
 
 from .utils import TokenArray, DistAlignedTokenArray, gather_sequence_block
-from .utils import calculate_op_num
+from .utils import calculate_op_num, add_gumbel_noise_power, get_num_transfer_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -995,3 +996,305 @@ class BlockDiffusionLLM(DiffusionLLM):
         logger.info(f'The number of diffusion iterations: {self.num_forwards}')
         return x.get_generated_tokens()
 
+
+
+class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
+    """BlockWise Diffusion LLM with MCMC refinement (Power Sampling)
+
+    This class extends BlockWiseDiffusionLLM to add MCMC-based block refinement
+    using the Power Sampling algorithm. After each block is denoised, it performs
+    MCMC iterations to sample from the power distribution p^α.
+
+    Parameters
+    ----------
+    model : Torch.Module
+        The LLM model
+    decoder : ParallelDecoder
+        The decoder that decodes tokens from logits
+    iterator_factory : IteratorFactory
+        Factory class that generates iterator on token array
+    enable_mcmc : bool
+        Whether to enable MCMC refinement (default: True)
+    n_mcmc_steps : int
+        Number of MCMC iterations per block (default: 5)
+    mcmc_alpha : float
+        Power parameter α for target distribution p^α (default: 4.0)
+    mcmc_temperature : float
+        Temperature for proposal distribution (default: 0.0)
+    """
+    def __init__(self, model, decoder, iterator_factory,
+                 enable_mcmc=True, n_mcmc_steps=5,
+                 mcmc_alpha=4.0, mcmc_temperature=0.0,
+                 tokenizer=None, verbose=True, **kwargs):
+        super().__init__(model, decoder, iterator_factory, **kwargs)
+        self.enable_mcmc = enable_mcmc
+        self.n_mcmc_steps = n_mcmc_steps
+        self.mcmc_alpha = mcmc_alpha
+        self.mcmc_temperature = mcmc_temperature
+        self.tokenizer = tokenizer
+        self.verbose = verbose
+
+    @ torch.no_grad()
+    def generate(self, prompt, gen_length=128, block_length=128):
+        """Generate tokens with diffusion iterations and MCMC refinement"""
+        # Initialize token array
+        x = TokenArray(prompt, gen_length, self.decoder.mask_id, self.decoder.eos_id, self.model.device)
+
+        # Initialize confidence tensors for MCMC
+        confidences_norm = torch.full(x.data.shape, -np.inf, dtype=torch.float32, device=x.device)
+        confidences_unnorm = torch.full(x.data.shape, -np.inf, dtype=torch.float32, device=x.device)
+
+        # Create iterator
+        it = self.iterator_factory.create(x, block_length)
+        self.diff_iteration.iter_no = 0
+        kv_cache = self.cache_factory.create() if self.cache_factory is not None else None
+
+        # Iterate over blocks
+        for block_id, (block_loc, block) in enumerate(it):
+            self.decoder.block_init(block, block_id)
+
+            # Phase 1: Denoise block
+            x, confidences_norm, confidences_unnorm = self._denoise_block(
+                x, block_loc, confidences_norm, confidences_unnorm, kv_cache, block_id
+            )
+
+            # Phase 2: MCMC refinement
+            if self.enable_mcmc:
+                x, confidences_norm, confidences_unnorm, acceptance_rate = self._mcmc_refine_block(
+                    x, block_loc, confidences_norm, confidences_unnorm, kv_cache
+                )
+                logger.info(f'Block {block_id} MCMC acceptance rate: {acceptance_rate:.2%}')
+
+            # Early stop if EOS
+            decode_compl = torch.any(x[:, block_loc.start:block_loc.end] == self.decoder.eos_id, dim=1)
+            if torch.all(decode_compl):
+                break
+
+        logger.info(f'The number of diffusion iterations: {self.num_forwards}')
+        return x.get_generated_tokens()
+
+    def _denoise_block(self, x, block_loc, confidences_norm, confidences_unnorm, kv_cache, block_id):
+        """Denoise a block using iterative denoising with confidence tracking"""
+        block = x[:, block_loc.start:block_loc.end]
+        step_count = 0
+        total_masks = (block == self.decoder.mask_id).sum().item()
+
+        while (block == self.decoder.mask_id).sum() > 0:
+            step_count += 1
+            # Forward pass
+            cache_update_kv = None
+            if kv_cache is not None and kv_cache.require_update(self.diff_iteration.iter_no, block_loc.start, block_loc.end):
+                output = self.model(x.data, use_cache=True)
+                cache_update_kv = output.past_key_values
+                self.diff_iteration.num_forwards += 1
+                logits = output.logits[:, block_loc.start:block_loc.end]
+                kv_cache.update(output.past_key_values)
+                self.diff_iteration.cache_updates += 1
+            elif kv_cache is None:
+                logits = self.model(x.data).logits[:, block_loc.start:block_loc.end]
+            elif kv_cache.cache_type == 'prefix':
+                past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
+                logits = self.model(x[:, block_loc.start:], past_key_values=past_key_values, use_cache=True,
+                        replace_position=replace_position).logits
+                block_length = block_loc.end - block_loc.start
+                logits = logits[:, :block_length]
+            else:
+                past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
+                logits = self.model(block, past_key_values=past_key_values, use_cache=True,
+                        replace_position=replace_position).logits
+
+            # Call decoder to decode and get confidences
+            conf_norm_block, conf_unnorm_block = self.decoder.decode(
+                logits, block_loc.start, block_loc.end, x, mcmc_alpha=self.mcmc_alpha
+            )
+
+            # Update global confidence tensors (only update non-inf values)
+            mask_updated = conf_norm_block > -np.inf
+            if mask_updated.any():
+                confidences_norm[:, block_loc.start:block_loc.end][mask_updated] = conf_norm_block[mask_updated]
+                confidences_unnorm[:, block_loc.start:block_loc.end][mask_updated] = conf_unnorm_block[mask_updated]
+
+            block = x[:, block_loc.start:block_loc.end]
+            self.diff_iteration.num_forwards += 1
+            self.diff_iteration.iter_no += 1
+
+            # Print intermediate denoising results
+            if self.verbose and self.tokenizer is not None:
+                prompt_length = x.prompt.shape[1]
+                current_output = x.data[:, prompt_length:]
+                decoded_output = self.tokenizer.batch_decode(current_output, skip_special_tokens=True)
+                print(f"[_denoise_block] Block {block_id}, Step {step_count}/{total_masks}: {decoded_output}")
+        # if self.verbose:
+        #     print(f"confidences_norm:{confidences_norm}")
+        #     print(f"confidences_unnorm:{confidences_unnorm}")
+
+        return x, confidences_norm, confidences_unnorm
+
+    def _mcmc_refine_block(self, x, block_loc, confidences_norm, confidences_unnorm, kv_cache):
+        """Refine current block using MCMC (Metropolis-Hastings)"""
+        acceptances = 0
+        attempts = 0
+        prompt_length = x.prompt.shape[1]
+
+        for mcmc_step in range(self.n_mcmc_steps):
+            attempts += 1
+
+            # Step 1: Randomly select resampling position within current block (must be >= prompt_length)
+            idx = random.randint(max(block_loc.start, prompt_length), block_loc.end - 1)
+
+            # Step 2: Generate proposal sequence
+            x_prop, conf_norm_prop, conf_unnorm_prop = self._generate_proposal(
+                x, idx, block_loc.end, confidences_norm.clone(), confidences_unnorm.clone()
+            )
+
+            # Step 3: Compute MH acceptance ratio
+            log_r = self._compute_acceptance_ratio(
+                confidences_norm, confidences_unnorm,
+                conf_norm_prop, conf_unnorm_prop,
+                idx, block_loc.end
+            )
+
+            # Step 4: Accept/reject decision
+            accept_prob = min(1.0, np.exp(min(log_r, 0.0)))
+            accepted = np.random.rand() < accept_prob
+
+            if self.verbose and self.tokenizer is not None:
+                print(f"\n[MCMC Step {mcmc_step+1}/{self.n_mcmc_steps}] idx={idx}, log_r={log_r:.4f}, accept_prob={accept_prob:.4f}, accepted={accepted}")
+
+            if accepted:
+                acceptances += 1
+                x = x_prop
+                # 只更新重新采样区域的置信度
+                confidences_norm[:, idx:block_loc.end] = conf_norm_prop[:, idx:block_loc.end]
+                confidences_unnorm[:, idx:block_loc.end] = conf_unnorm_prop[:, idx:block_loc.end]
+
+                if self.verbose and self.tokenizer is not None:
+                    current_output = x.data[:, prompt_length:]
+                    decoded = self.tokenizer.batch_decode(current_output, skip_special_tokens=True)
+                    print(f"[ACCEPTED] New sequence: {decoded}")
+                    # print(f"new_confidences_norm:{confidences_norm}")
+                    # print(f"new_confidences_unnorm:{confidences_unnorm}")
+            else:
+                if self.verbose and self.tokenizer is not None:
+                    current_output = x.data[:, prompt_length:]
+                    decoded = self.tokenizer.batch_decode(current_output, skip_special_tokens=True)
+                    print(f"[REJECTED] Keep sequence: {decoded}")
+
+        # Check for EOS token after MCMC refinement
+        if self.decoder.eos_id in x.data[0, block_loc.start:block_loc.end]:
+            # Find EOS position
+            block_tokens = x.data[0, block_loc.start:block_loc.end].tolist()
+            eos_idx = block_tokens.index(self.decoder.eos_id) + block_loc.start
+
+            # Truncate confidences at EOS
+            confidences_norm[:, eos_idx+1:] = -np.inf
+            confidences_unnorm[:, eos_idx+1:] = -np.inf
+
+            if self.verbose:
+                print(f"[MCMC] EOS token detected at position {eos_idx}, truncating confidences")
+
+        acceptance_rate = acceptances / attempts if attempts > 0 else 0.0
+        return x, confidences_norm, confidences_unnorm, acceptance_rate
+
+    def _generate_proposal(self, x_current, idx, block_end, confidences_norm, confidences_unnorm):
+        """Generate proposal sequence by remasking and denoising from idx to block_end"""
+        # Clone current sequence
+        x_prop = TokenArray(x_current.prompt, x_current.gen_length, self.decoder.mask_id, self.decoder.eos_id, x_current.device)
+        x_prop.data = x_current.data.clone()
+
+        # Remask from idx to block_end
+        x_prop.data[:, idx:block_end] = self.decoder.mask_id
+
+        # Reset confidences for remasked region
+        conf_norm_prop = confidences_norm.clone()
+        conf_unnorm_prop = confidences_unnorm.clone()
+        conf_norm_prop[:, idx:block_end] = -np.inf
+        conf_unnorm_prop[:, idx:block_end] = -np.inf
+
+        # Iterative denoising (same as _denoise_block but for proposal)
+        block = x_prop.data[:, idx:block_end]
+        block_mask_index = (block == self.decoder.mask_id)
+        steps = (block == self.decoder.mask_id).sum().item()
+
+        if self.verbose and self.tokenizer is not None:
+            print(f"[_generate_proposal] Starting denoising from idx={idx} to {block_end}, steps={steps}")
+
+        if steps > 0:
+            num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+
+            for i in range(steps):
+                # Forward pass (no KV cache for simplicity)
+                logits = self.model(x_prop.data).logits[:, idx:block_end]
+
+                # Compute dual log probabilities
+                log_p_norm = torch.nn.functional.log_softmax(logits, dim=-1)
+                log_p_unnorm = torch.nn.functional.log_softmax(self.mcmc_alpha * logits, dim=-1)
+
+                # Sample with Gumbel noise
+                logits_with_noise = add_gumbel_noise_power(logits, alpha=1.0, temperature=self.mcmc_temperature)
+                x0 = torch.argmax(logits_with_noise, dim=-1)
+
+                # Get log probs for selected tokens
+                x0_logp_norm = torch.gather(log_p_norm, -1, x0.unsqueeze(-1)).squeeze(-1)
+                x0_logp_unnorm = torch.gather(log_p_unnorm, -1, x0.unsqueeze(-1)).squeeze(-1)
+
+                # Compute confidence for remasking
+                p = torch.nn.functional.softmax(logits, dim=-1)
+                x0_p = torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1)
+
+                # Select tokens to transfer
+                mask_index = (block == self.decoder.mask_id)
+                x0 = torch.where(mask_index, x0, block)
+                confidence = torch.where(mask_index, x0_p, -np.inf)
+
+                transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+                for j in range(confidence.shape[0]):
+                    _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
+                    transfer_index[j, select_index] = True
+
+                # Update proposal sequence and confidences
+                if transfer_index.any():
+                    x_prop.data[:, idx:block_end][transfer_index] = x0[transfer_index]
+                    conf_norm_prop[:, idx:block_end][transfer_index] = x0_logp_norm[transfer_index].float()
+                    conf_unnorm_prop[:, idx:block_end][transfer_index] = x0_logp_unnorm[transfer_index].float()
+
+                block = x_prop.data[:, idx:block_end]
+
+                # Print intermediate proposal generation results
+                if self.verbose and self.tokenizer is not None:
+                    prompt_length = x_prop.prompt.shape[1]
+                    current_output = x_prop.data[:, prompt_length:block_end]
+                    decoded_proposal = self.tokenizer.batch_decode(current_output, skip_special_tokens=True)
+                    print(f"[_generate_proposal] Step {i+1}/{steps}: {decoded_proposal}")
+
+        return x_prop, conf_norm_prop, conf_unnorm_prop
+
+    def _compute_acceptance_ratio(self, confidences_norm_cur, confidences_unnorm_cur,
+                                   confidences_norm_prop, confidences_unnorm_prop,
+                                   idx, block_end):
+        """Compute Metropolis-Hastings acceptance ratio"""
+        # Extract log probabilities for the resampled region [idx, block_end)
+        log_prob_cur_norm = confidences_norm_cur[:, idx:block_end].view(-1).tolist()
+        log_prob_cur_unnorm = confidences_unnorm_cur[:, idx:block_end].view(-1).tolist()
+        log_prob_prop_norm = confidences_norm_prop[:, idx:block_end].view(-1).tolist()
+        log_prob_prop_unnorm = confidences_unnorm_prop[:, idx:block_end].view(-1).tolist()
+
+        # Filter out -inf values
+        log_prob_cur_norm = [x for x in log_prob_cur_norm if x > -np.inf]
+        log_prob_cur_unnorm = [x for x in log_prob_cur_unnorm if x > -np.inf]
+        log_prob_prop_norm = [x for x in log_prob_prop_norm if x > -np.inf]
+        log_prob_prop_unnorm = [x for x in log_prob_prop_unnorm if x > -np.inf]
+
+        print(f"[Acceptance Ratio] log_prob_cur_norm: {log_prob_cur_norm} | sum: {sum(log_prob_cur_norm)}")
+        print(f"[Acceptance Ratio] log_prob_cur_unnorm: {log_prob_cur_unnorm} | sum: {sum(log_prob_cur_unnorm)}")
+        print(f"[Acceptance Ratio] log_prob_prop_norm: {log_prob_prop_norm} | sum: {sum(log_prob_prop_norm)}")
+        print(f"[Acceptance Ratio] log_prob_prop_unnorm: {log_prob_prop_unnorm} | sum: {sum(log_prob_prop_unnorm)}")
+
+        assert len(log_prob_cur_norm) == len(log_prob_prop_norm), "Mismatched lengths in norm log probs"
+        assert len(log_prob_cur_unnorm) == len(log_prob_prop_unnorm), "Mismatched lengths in unnorm log probs"
+        
+        # MH acceptance ratio: log r = log[p^α(x') * q(x|x')] - log[p^α(x) * q(x'|x)]
+        log_r = (sum(log_prob_prop_unnorm) + sum(log_prob_cur_norm)
+                - sum(log_prob_cur_unnorm) - sum(log_prob_prop_norm))
+
+        return log_r

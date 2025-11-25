@@ -323,6 +323,50 @@ class ThresholdParallelDecoder(ParallelDecoder):
         assert transfer_index.dtype == torch.bool
         x[:, block_start:block_end] = torch.where(transfer_index, x0, curr_x)
 
+class MCMCThresholdParallelDecoder(ThresholdParallelDecoder):
+    """MCMC专用的阈值解码器，返回置信度以支持Power Sampling"""
+
+    def decode(self, logits, block_start, block_end, x, mcmc_alpha=1.0, iter_threshold=None):
+        """解码并返回双重置信度
+
+        Returns:
+            confidences_norm: 归一化置信度 (alpha=1.0)
+            confidences_unnorm: 非归一化置信度 (alpha=mcmc_alpha)
+        """
+        if iter_threshold is None:
+            iter_threshold = self.threshold
+
+        mask_index = (x[:, block_start:block_end] == self.mask_id)
+        assert mask_index.shape[1] == logits.shape[1]
+        curr_x = x[:, block_start:block_end]
+
+        # 调用 get_transfer_index_threshold 获取 x0 和 transfer_index
+        x0, transfer_index = get_transfer_index_threshold(
+            logits, self.temperature, mask_index, curr_x,
+            self.mask_id, threshold=iter_threshold, use_float64=self.use_float64
+        )
+
+        # 计算双重置信度
+        log_p_norm = F.log_softmax(logits, dim=-1)
+        log_p_unnorm = F.log_softmax(mcmc_alpha * logits, dim=-1)
+
+        x0_logp_norm = torch.gather(log_p_norm, -1, x0.unsqueeze(-1)).squeeze(-1)
+        x0_logp_unnorm = torch.gather(log_p_unnorm, -1, x0.unsqueeze(-1)).squeeze(-1)
+
+        # 只在 transfer_index 位置保存置信度
+        confidences_norm = torch.full_like(x0, -np.inf, dtype=torch.float32)
+        confidences_unnorm = torch.full_like(x0, -np.inf, dtype=torch.float32)
+
+        confidences_norm[transfer_index] = x0_logp_norm[transfer_index].float()
+        confidences_unnorm[transfer_index] = x0_logp_unnorm[transfer_index].float()
+
+        # 更新 x
+        transfer_index = torch.logical_and(transfer_index, mask_index)
+        assert transfer_index.dtype == torch.bool
+        x[:, block_start:block_end] = torch.where(transfer_index, x0, curr_x)
+
+        return confidences_norm, confidences_unnorm
+
 class CreditThresholdParallelDecoder(ThresholdParallelDecoder):
     """ This decoder deocdes tokens in parallel based on a threshold + credit.
 

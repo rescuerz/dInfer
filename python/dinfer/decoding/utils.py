@@ -18,6 +18,19 @@ def add_gumbel_noise(logits, temperature):
     gumbel_noise = (- torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 
+def add_gumbel_noise_power(logits, alpha=4.0, temperature=0.0):
+    """
+    Power-scaled Gumbel noise for MCMC sampling.
+    Applies power scaling (alpha) before adding Gumbel noise.
+    """
+    scaled_logits = alpha * logits
+    if temperature == 0:
+        return scaled_logits
+    scaled_logits = scaled_logits.to(torch.float64)
+    noise = torch.rand_like(scaled_logits, dtype=torch.float64)
+    gumbel_noise = (- torch.log(noise)) ** temperature
+    return scaled_logits.exp() / gumbel_noise
+
 def get_num_transfer_tokens(mask_index, steps):
     '''
     In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
