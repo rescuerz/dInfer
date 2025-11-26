@@ -3,11 +3,45 @@ BlockMCMC Inference Script
 
 使用 BlockMCMCDiffusionLLM 进行推理，支持 MCMC Power Sampling 精炼。
 
-Usage:
-    python block_mcmc_inference.py [--enable_mcmc] [--n_mcmc_steps N] [--mcmc_alpha ALPHA]
-    
-Example:
-    python block_mcmc_inference.py --enable_mcmc --n_mcmc_steps 3 --mcmc_alpha 4.0
+================================================================================
+常用命令示例
+================================================================================
+
+# 1. 基本使用（默认启用 MCMC，不使用 KV Cache）
+python block_mcmc_inference.py
+
+# 2. 禁用 MCMC（仅使用扩散解码）
+python block_mcmc_inference.py --disable_mcmc
+
+# 3. 使用 KV Cache（prefix 模式）
+python block_mcmc_inference.py --use_kv_cache --kv_cache_type prefix
+
+# 4. 使用 KV Cache（dual 模式，推荐）
+python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual
+
+# 5. MCMC 提议生成使用 KV Cache 加速（需要先启用 KV Cache）
+python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual --mcmc_use_kv_cache
+
+# 6. MCMC 提议生成不使用 KV Cache（即使主解码使用 KV Cache）
+python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual --no_mcmc_kv_cache
+
+# 7. 完整配置示例（推荐生产环境）
+python block_mcmc_inference.py \\
+    --use_kv_cache --kv_cache_type dual \\
+    --enable_mcmc --n_mcmc_steps 3 --mcmc_alpha 4.0 \\
+    --mcmc_use_kv_cache \\
+    --gen_length 256 --block_length 32
+
+# 8. 调试模式（详细输出）
+python block_mcmc_inference.py --verbose
+
+# 9. 自定义 prompt
+python block_mcmc_inference.py --prompt "What is the capital of France?"
+
+# 10. 打印版本和配置信息
+python block_mcmc_inference.py --version
+
+================================================================================
 """
 
 import os
@@ -23,9 +57,28 @@ from dinfer.model import LLaDAMoeModelLM
 from dinfer import BlockIteratorFactory, KVCacheFactory
 from dinfer import MCMCThresholdParallelDecoder, BlockMCMCDiffusionLLM
 
+__version__ = "1.1.0"
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='BlockMCMC Diffusion LLM Inference')
+    parser = argparse.ArgumentParser(
+        description='BlockMCMC Diffusion LLM Inference',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage
+  python block_mcmc_inference.py
+  
+  # With KV Cache (dual mode)
+  python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual
+  
+  # MCMC with KV Cache acceleration
+  python block_mcmc_inference.py --use_kv_cache --mcmc_use_kv_cache
+        """
+    )
+    
+    # Version
+    parser.add_argument('--version', action='store_true', help='Print version and configuration info')
     
     # Model settings
     parser.add_argument('--model_path', type=str, 
@@ -35,7 +88,7 @@ def parse_args():
     
     # Generation settings
     parser.add_argument('--gen_length', type=int, default=256, help='Generation length')
-    parser.add_argument('--block_length', type=int, default=32, help='Block length')
+    parser.add_argument('--block_length', type=int, default=64, help='Block length')
     parser.add_argument('--temperature', type=float, default=0.9, help='Sampling temperature')
     parser.add_argument('--threshold', type=float, default=0.9, help='Confidence threshold')
     
@@ -47,9 +100,15 @@ def parse_args():
     parser.add_argument('--mcmc_temperature', type=float, default=0.9, help='MCMC temperature')
     
     # KV Cache settings
-    parser.add_argument('--use_kv_cache', action='store_true', help='Enable KV cache')
+    parser.add_argument('--use_kv_cache', action='store_true', help='Enable KV cache for main decoding')
     parser.add_argument('--kv_cache_type', type=str, default='dual', choices=['prefix', 'dual'],
-                        help='KV cache type')
+                        help='KV cache type: prefix (前缀缓存) or dual (双向缓存)')
+    
+    # MCMC KV Cache settings
+    parser.add_argument('--mcmc_use_kv_cache', action='store_true', default=False,
+                        help='Enable KV cache acceleration in MCMC proposal generation')
+    parser.add_argument('--no_mcmc_kv_cache', action='store_true',
+                        help='Disable KV cache in MCMC proposal generation (even if main decoding uses KV cache)')
     
     # Output settings
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
@@ -61,7 +120,38 @@ def parse_args():
     if args.disable_mcmc:
         args.enable_mcmc = False
     
+    # Handle MCMC KV cache settings
+    # 如果显式禁用，则设置为 False
+    if args.no_mcmc_kv_cache:
+        args.mcmc_use_kv_cache = False
+    # 如果启用了主 KV cache 且没有显式禁用 MCMC KV cache，默认启用
+    elif args.use_kv_cache and not args.no_mcmc_kv_cache:
+        # 如果用户没有显式设置 mcmc_use_kv_cache，则跟随 use_kv_cache
+        if not args.mcmc_use_kv_cache:
+            args.mcmc_use_kv_cache = True
+    
     return args
+
+
+def print_version_info():
+    """Print version and configuration information"""
+    print("=" * 60)
+    print(f"BlockMCMC Inference Script v{__version__}")
+    print("=" * 60)
+    print("\n📦 Dependencies:")
+    print(f"  - PyTorch: {torch.__version__}")
+    print(f"  - CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"  - CUDA version: {torch.version.cuda}")
+        print(f"  - GPU: {torch.cuda.get_device_name(0)}")
+    
+    print("\n🔧 Available options:")
+    print("  KV Cache types: prefix, dual")
+    print("  MCMC parameters: alpha, temperature, n_steps")
+    print("  MCMC KV Cache: --mcmc_use_kv_cache / --no_mcmc_kv_cache")
+    
+    print("\n📖 For full help, run: python block_mcmc_inference.py --help")
+    print("=" * 60)
 
 
 def setup_distributed():
@@ -122,6 +212,7 @@ def create_dllm(model, tokenizer, args):
         n_mcmc_steps=args.n_mcmc_steps,
         mcmc_alpha=args.mcmc_alpha,
         mcmc_temperature=args.mcmc_temperature,
+        mcmc_use_kv_cache=args.mcmc_use_kv_cache,  # 新增：MCMC 提议生成是否使用 KV Cache
         tokenizer=tokenizer,
         verbose=args.verbose
     )
@@ -141,8 +232,13 @@ def prepare_input(tokenizer, prompt, device):
 def main():
     args = parse_args()
     
+    # Handle --version flag
+    if args.version:
+        print_version_info()
+        return
+    
     print("=" * 60)
-    print("BlockMCMC Diffusion LLM Inference")
+    print(f"BlockMCMC Diffusion LLM Inference v{__version__}")
     print("=" * 60)
     
     # Print configuration
@@ -153,12 +249,21 @@ def main():
     print(f"  Block length: {args.block_length}")
     print(f"  Temperature: {args.temperature}")
     print(f"  Threshold: {args.threshold}")
+    
+    print(f"\n🎯 MCMC Settings:")
     print(f"  MCMC enabled: {args.enable_mcmc}")
     if args.enable_mcmc:
         print(f"  MCMC steps: {args.n_mcmc_steps}")
         print(f"  MCMC alpha: {args.mcmc_alpha}")
         print(f"  MCMC temperature: {args.mcmc_temperature}")
-    print(f"  KV cache: {args.use_kv_cache}")
+    
+    print(f"\n💾 KV Cache Settings:")
+    print(f"  Main KV cache: {args.use_kv_cache}")
+    if args.use_kv_cache:
+        print(f"  KV cache type: {args.kv_cache_type}")
+    print(f"  MCMC KV cache: {args.mcmc_use_kv_cache}")
+    
+    print(f"\n🔧 Other Settings:")
     print(f"  Verbose: {args.verbose}")
     
     # Setup
