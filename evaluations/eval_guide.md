@@ -1,11 +1,14 @@
-## Evaluate Dinfer performance on different benchmarks 
+<!-- @format -->
+
+## Evaluate Dinfer performance on different benchmarks
+
 We provide an evaluation framework based on dInfer integrated with the 🤗 HuggingFace lm‑eval‑harness.
 It supports Tensor Parallel (TP) and Data Parallel (DP) inference for easy evaluation of large‑scale dLLMs.
 
 For the llada‑moe model, we have adapted two benchmark tasks already integrated in this framework:
 
-* mbpp_sanitized_llada: A sanitized Python code‑generation benchmark derived from MBPP;
-* gsm8k_llada: A math reasoning benchmark adapted from GSM8K.
+- mbpp_sanitized_llada: A sanitized Python code‑generation benchmark derived from MBPP;
+- gsm8k_llada: A math reasoning benchmark adapted from GSM8K.
 
 ### 1️⃣ Install Dependencies
 
@@ -55,6 +58,7 @@ parallel='tp'            # 'tp' for tensor parallel, 'dp' for accelerate DP
 # for llada moe use tasks gsm8k_llada_moe mbpp_sanitized_llada_moe
 task=mbpp_sanitized_llada_moe # or gsm8k_llada_moe
 ```
+
 ### ⚙️ Run with Tensor Parallel (TP)
 
 Run evaluation with **multi‑GPU tensor parallelism** (default):
@@ -91,8 +95,7 @@ python eval_dinfer.py \
   --apply_chat_template
 ```
 
-💡 *Internally, this launches multiple GPU processes and automatically initializes NCCL and tensor‑parallel communication.*
-
+💡 _Internally, this launches multiple GPU processes and automatically initializes NCCL and tensor‑parallel communication._
 
 ### 🧩 Run with Accelerate (Data Parallel, DP)
 
@@ -195,3 +198,52 @@ python eval_dinfer.py \
   --apply_chat_template \
   --log_samples
 ```
+
+---
+
+### 🎯 Use MCMC Power Sampling for Quality Improvement
+
+Enable MCMC refinement using `eval_dinfer_mcmc.py` for improved generation quality:
+
+```bash
+# MCMC parameters
+parallel_decoding='mcmc_threshold'
+threshold=0.9
+n_mcmc_steps=3           # Number of MCMC steps per block
+mcmc_alpha=4.0           # Power parameter α for target distribution p^α
+mcmc_temperature=0.9     # MCMC sampling temperature
+mcmc_use_kv_cache=True   # Enable KV cache in MCMC proposal generation
+
+python eval_dinfer_mcmc.py \
+  --tasks ${task} \
+  --confirm_run_unsafe_code \
+  --model dInfer_eval \
+  --model_args \
+  model_path=${model_path},\
+  gen_length=${length},\
+  block_length=${block_length},\
+  threshold=${threshold},\
+  show_speed=True,\
+  save_dir=${output_path},\
+  parallel_decoding=${parallel_decoding},\
+  cache=${cache},\
+  n_mcmc_steps=${n_mcmc_steps},\
+  mcmc_alpha=${mcmc_alpha},\
+  mcmc_temperature=${mcmc_temperature},\
+  mcmc_use_kv_cache=${mcmc_use_kv_cache},\
+  use_compile=${use_compile},\
+  parallel=${parallel},\
+  gpus=${gpus} \
+  --output_path ${output_path} \
+  --include_path ./tasks \
+  --apply_chat_template
+```
+
+**MCMC Parameters:**
+
+- `n_mcmc_steps`: Number of MCMC iterations per block (default: 3). More steps = better quality but slower.
+- `mcmc_alpha`: Power parameter α for target distribution p^α (default: 4.0). Higher values favor high-probability sequences.
+- `mcmc_temperature`: Temperature for MCMC sampling (default: 0.9).
+- `mcmc_use_kv_cache`: Enable KV cache acceleration in MCMC proposal generation (recommended with `cache='dual'`).
+
+💡 _MCMC refinement improves generation quality by sampling from the power distribution p^α using Metropolis-Hastings algorithm._
