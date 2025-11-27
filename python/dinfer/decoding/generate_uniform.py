@@ -1166,22 +1166,28 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
     using the Power Sampling algorithm. After each block is denoised, it performs
     MCMC iterations to sample from the power distribution p^α.
     
-    Architecture:
+    Architecture (when enable_mcmc=True):
     - Uses MCMCDiffusionIteration for diffusion iterations with confidence tracking
     - Uses MCMCBlockRunner for block-level decoding
     - Uses MCMCProposalGenerator for generating MCMC proposals
     - Uses MCMCRefinementRunner for MCMC refinement
+    
+    Architecture (when enable_mcmc=False):
+    - Uses BaseDiffusionIteration or ShiftDiffusionIteration (same as BlockWiseDiffusionLLM)
+    - Uses BlockRunner for block-level decoding
+    - Completely degrades to BlockWiseDiffusionLLM behavior
 
     Parameters
     ----------
     model : Torch.Module
         The LLM model
-    decoder : MCMCThresholdParallelDecoder
-        The decoder that decodes tokens from logits (must support mcmc_alpha)
+    decoder : MCMCThresholdParallelDecoder or ThresholdParallelDecoder
+        The decoder that decodes tokens from logits
     iterator_factory : IteratorFactory
         Factory class that generates iterator on token array
     enable_mcmc : bool
         Whether to enable MCMC refinement (default: True)
+        When False, degrades to BlockWiseDiffusionLLM behavior
     n_mcmc_steps : int
         Number of MCMC iterations per block (default: 5)
     mcmc_alpha : float
@@ -1198,6 +1204,12 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
         - proposal_alpha>1.0: power-scaled decoding for better proposal quality
         Higher values make the proposal distribution more concentrated on high-probability
         tokens, potentially improving acceptance rate and sample quality.
+    use_shift : bool
+        Whether to use shift decoding (only effective when enable_mcmc=False).
+        When enable_mcmc=False and use_shift=True, uses ShiftDiffusionIteration.
+        When enable_mcmc=False and use_shift=False, uses BaseDiffusionIteration.
+        This parameter is ignored when enable_mcmc=True.
+        (default: False)
     tokenizer : Tokenizer, optional
         Tokenizer for verbose output
     verbose : bool
@@ -1208,6 +1220,7 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
                  mcmc_alpha=4.0, mcmc_temperature=0.0,
                  mcmc_use_kv_cache=True,
                  proposal_alpha=1.0,
+                 use_shift=False,
                  tokenizer=None, verbose=False,
                  early_stop=True, cache_factory=None, 
                  maximum_unroll=4, expected_tpf=8, **kwargs):
@@ -1223,36 +1236,41 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
         self.mcmc_alpha = mcmc_alpha
         self.mcmc_temperature = mcmc_temperature
         self.mcmc_use_kv_cache = mcmc_use_kv_cache
-        self.proposal_alpha = proposal_alpha  # 提议序列的 power scaling 参数
+        self.proposal_alpha = proposal_alpha
+        self.use_shift = use_shift
         self.tokenizer = tokenizer
         self.verbose = verbose
         
-        # 使用 MCMCDiffusionIteration 替代 BaseDiffusionIteration
-        self.diff_iteration = MCMCDiffusionIteration(
-            mcmc_alpha=mcmc_alpha,
-            mcmc_temperature=mcmc_temperature
-        )
-        
-        # 使用 MCMCBlockRunner 替代 BlockRunner
-        self.block_decoder = MCMCBlockRunner(
-            self.diff_iteration, early_stop, maximum_unroll, expected_tpf
-        )
-        
-        # 创建 MCMC 组件
         if enable_mcmc:
+            # MCMC 模式：使用 MCMC 专用组件
+            self.diff_iteration = MCMCDiffusionIteration(
+                mcmc_alpha=mcmc_alpha,
+                mcmc_temperature=mcmc_temperature
+            )
+            self.block_decoder = MCMCBlockRunner(
+                self.diff_iteration, early_stop, maximum_unroll, expected_tpf
+            )
             self.proposal_generator = MCMCProposalGenerator(
                 model=model,
                 decoder=decoder,
                 mcmc_alpha=mcmc_alpha,
                 mcmc_temperature=mcmc_temperature,
                 use_kv_cache=mcmc_use_kv_cache,
-                proposal_alpha=proposal_alpha  # 传递 proposal_alpha 给提议生成器
+                proposal_alpha=proposal_alpha
             )
             self.mcmc_runner = MCMCRefinementRunner(
                 proposal_generator=self.proposal_generator,
                 n_mcmc_steps=n_mcmc_steps
             )
         else:
+            # 退化模式：使用与 BlockWiseDiffusionLLM 相同的组件
+            if use_shift:
+                self.diff_iteration = ShiftDiffusionIteration()
+            else:
+                self.diff_iteration = BaseDiffusionIteration()
+            self.block_decoder = BlockRunner(
+                self.diff_iteration, early_stop, maximum_unroll, expected_tpf
+            )
             self.proposal_generator = None
             self.mcmc_runner = None
 
@@ -1275,9 +1293,11 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
     def generate(self, prompt, gen_length=128, block_length=128):
         """Generate tokens with diffusion iterations and MCMC refinement
         
-        Two-phase decoding per block:
+        Two-phase decoding per block (when enable_mcmc=True):
         Phase 1: Standard diffusion denoising (using MCMCDiffusionIteration + MCMCBlockRunner)
         Phase 2: MCMC refinement (using MCMCRefinementRunner)
+        
+        When enable_mcmc=False, only Phase 1 is executed using BlockWiseDiffusionLLM components.
         """
         # Initialize token array
         x = TokenArray(prompt, gen_length, self.decoder.mask_id, self.decoder.eos_id, self.model.device)
@@ -1285,8 +1305,13 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
         # Create iterator
         it = self.iterator_factory.create(x, block_length)
         
-        # Reset iteration state and initialize confidence tensors
-        self.diff_iteration.reset_confidences(x.data.shape, x.device)
+        # Reset iteration state
+        if self.enable_mcmc:
+            # MCMC 模式：重置置信度张量
+            self.diff_iteration.reset_confidences(x.data.shape, x.device)
+        else:
+            # 退化模式：只重置 iter_no（与 BlockWiseDiffusionLLM 一致）
+            self.diff_iteration.iter_no = 0
         
         # Note: Do NOT reset num_forwards here to maintain cumulative counting
         # This is consistent with other DiffusionLLM classes (e.g., BlockWiseDiffusionLLM)
@@ -1313,8 +1338,8 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
                 self.model, self.decoder, x, kv_cache, block, block_loc, block_id
             )
             
-            # DEBUG: 检查 Phase 1 完成后的置信度状态
-            if self.DEBUG_MCMC_GENERATE:
+            # DEBUG: 检查 Phase 1 完成后的置信度状态（仅 MCMC 模式）
+            if self.DEBUG_MCMC_GENERATE and self.enable_mcmc:
                 block_conf = self.diff_iteration.confidences_norm[:, block_loc.start:block_loc.end]
                 num_inf = (block_conf == -np.inf).sum().item()
                 block_length_actual = block_loc.end - block_loc.start
@@ -1339,6 +1364,11 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
                     if len(inf_positions[1]) > 0:
                         actual_positions = [p + gen_start_in_block for p in inf_positions[1][:20].tolist()]
                         print(f"  -inf positions (relative to block, gen region only): {actual_positions}")
+            elif self.DEBUG_MCMC_GENERATE and not self.enable_mcmc:
+                # 退化模式：简单打印块处理信息
+                block_tokens = x.data[:, block_loc.start:block_loc.end]
+                num_masks = (block_tokens == self.decoder.mask_id).sum().item()
+                print(f"[Phase 1 DONE] block={block_id}, masks_remaining={num_masks} (degraded mode)")
             
             if self.verbose and self.tokenizer is not None:
                 current_output = x.data[:, prompt_length:]
@@ -1713,10 +1743,9 @@ class MCMCProposalGenerator:
         """
         从 idx 位置开始重新生成序列，使用 MCMCThresholdParallelDecoder 解码。
         
-        与 Phase 1 使用相同的解码策略，确保一致性：
-        - 使用相同的 decoder（MCMCThresholdParallelDecoder）
-        - 使用相同的 temperature 和 threshold
-        - 使用相同的 mcmc_alpha
+        同时计算：
+        - q(x'|x): 提议序列 x' 在当前上下文中的概率（用于 MH 接受率分子）
+        - q(x|x'): 原始序列 x 在提议上下文中的概率（用于 MH 接受率分母）
         
         Parameters
         ----------
@@ -1739,30 +1768,45 @@ class MCMCProposalGenerator:
             
         Returns
         -------
-        tuple : (x_prop, conf_norm_prop, conf_unnorm_prop)
+        tuple : (x_prop, conf_norm_prop, conf_unnorm_prop, reverse_conf_norm, reverse_conf_unnorm)
+            - x_prop: 提议序列
+            - conf_norm_prop: q(x'|x) 的归一化置信度
+            - conf_unnorm_prop: q(x'|x) 的非归一化置信度
+            - reverse_conf_norm: q(x|x') 的归一化置信度（原始 token 在提议上下文中的概率）
+            - reverse_conf_unnorm: q(x|x') 的非归一化置信度
         """
         from .parallel_strategy import MCMCThresholdParallelDecoder
+        import torch.nn.functional as F
         
-        # Step 1: 克隆当前序列
+        # Step 1: 保存原始序列的 token（用于计算 q(x|x')）
+        original_tokens = x_current.data[:, idx:block_end].clone()
+        
+        # Step 2: 克隆当前序列
         x_prop = TokenArray(x_current.prompt, x_current.gen_length, 
                            self.decoder.mask_id, self.decoder.eos_id, x_current.device)
         x_prop.data = x_current.data.clone()
         
-        # Step 2: 重新掩码 [idx, block_end) 区域
+        # Step 3: 重新掩码 [idx, block_end) 区域
         x_prop.data[:, idx:block_end] = self.decoder.mask_id
         
-        # Step 3: 重置置信度
+        # Step 4: 重置置信度
         conf_norm_prop = confidences_norm.clone()
         conf_unnorm_prop = confidences_unnorm.clone()
         conf_norm_prop[:, idx:block_end] = -np.inf
         conf_unnorm_prop[:, idx:block_end] = -np.inf
         
-        # Step 4: 检查是否可以使用 KV Cache
+        # Step 5: 初始化逆向置信度（q(x|x')）
+        reverse_conf_norm = confidences_norm.clone()
+        reverse_conf_unnorm = confidences_unnorm.clone()
+        reverse_conf_norm[:, idx:block_end] = -np.inf
+        reverse_conf_unnorm[:, idx:block_end] = -np.inf
+        
+        # Step 6: 检查是否可以使用 KV Cache
         can_use_kv_cache = (self.use_kv_cache and 
                            kv_cache is not None and 
                            kv_cache.past_key_values is not None)
         
-        # Step 5: 迭代去噪（使用 MCMCThresholdParallelDecoder，与 Phase 1 一致）
+        # Step 7: 迭代去噪
         block = x_prop.data[:, idx:block_end]
         initial_masks = (block == self.decoder.mask_id).sum().item()
         iteration_count = 0
@@ -1779,25 +1823,37 @@ class MCMCProposalGenerator:
             self.num_forwards += 1
             
             # 使用 MCMCThresholdParallelDecoder 解码
-            # 关键区别：提议序列使用 proposal_alpha 进行 power-scaled 解码
             if isinstance(self.decoder, MCMCThresholdParallelDecoder):
                 conf_norm_block, conf_unnorm_block = self.decoder.decode(
                     logits, idx, block_end, x_prop,
                     mcmc_alpha=self.mcmc_alpha,
-                    proposal_alpha=self.proposal_alpha  # 使用 power-scaled 解码生成更高质量的提议
+                    proposal_alpha=self.proposal_alpha
                 )
                 
-                # 更新置信度（只更新有效的位置）
+                # 更新 q(x'|x) 置信度
                 if conf_norm_block is not None:
                     mask_updated = conf_norm_block > -np.inf
                     if mask_updated.any():
                         conf_norm_prop[:, idx:block_end][mask_updated] = conf_norm_block[mask_updated]
                         conf_unnorm_prop[:, idx:block_end][mask_updated] = conf_unnorm_block[mask_updated]
+                        
+                        # 关键：同时计算 q(x|x') - 原始 token 在当前 logits 下的概率
+                        # 这是逆向提议分布的近似
+                        log_p_norm = F.log_softmax(logits, dim=-1)
+                        log_p_unnorm = F.log_softmax(self.mcmc_alpha * logits, dim=-1)
+                        
+                        # 获取原始 token 的概率
+                        orig_logp_norm = torch.gather(log_p_norm, -1, original_tokens.unsqueeze(-1)).squeeze(-1)
+                        orig_logp_unnorm = torch.gather(log_p_unnorm, -1, original_tokens.unsqueeze(-1)).squeeze(-1)
+                        
+                        # 更新逆向置信度（只在被解码的位置更新）
+                        reverse_conf_norm[:, idx:block_end][mask_updated] = orig_logp_norm[mask_updated].float()
+                        reverse_conf_unnorm[:, idx:block_end][mask_updated] = orig_logp_unnorm[mask_updated].float()
             else:
                 # 回退到标准解码器
                 self.decoder.decode(logits, idx, block_end, x_prop)
             
-            # 更新 block 引用（关键：确保使用最新的数据）
+            # 更新 block 引用
             block = x_prop.data[:, idx:block_end]
             
             if verbose and tokenizer is not None:
@@ -1811,7 +1867,7 @@ class MCMCProposalGenerator:
         if verbose and tokenizer is not None:
             print(f"[MCMCProposalGenerator] Completed in {iteration_count} iterations")
         
-        return x_prop, conf_norm_prop, conf_unnorm_prop
+        return x_prop, conf_norm_prop, conf_unnorm_prop, reverse_conf_norm, reverse_conf_unnorm
 
 
 class MCMCRefinementRunner:
@@ -1868,6 +1924,14 @@ class MCMCRefinementRunner:
         """
         对块进行 MCMC 精炼。
         
+        使用正确的 MH 接受率公式：
+        log r = log[p^α(x')] + log[q(x|x')] - log[p^α(x)] - log[q(x'|x)]
+        
+        其中：
+        - p^α(x) 和 p^α(x') 是目标分布（power distribution）
+        - q(x'|x) 是从 x 到 x' 的提议概率
+        - q(x|x') 是从 x' 到 x 的逆向提议概率（在提议上下文中原始 token 的概率）
+        
         Parameters
         ----------
         x : TokenArray
@@ -1907,7 +1971,6 @@ class MCMCRefinementRunner:
         
         for mcmc_step in range(self.n_mcmc_steps):
             # Step 1: 随机选择重采样位置 (必须在生成区域内)
-            # 使用 torch 生成随机数，确保多 GPU 环境下的同步
             idx = self._sync_random_int(effective_block_start, block_loc.end - 1, x.device)
             
             # Step 2: 创建 KV Cache 快照（如果使用 KV Cache）
@@ -1916,25 +1979,28 @@ class MCMCRefinementRunner:
                 snapshot = KVCacheSnapshot(idx, block_loc.end)
                 snapshot.save(kv_cache)
             
-            # Step 3: 生成提议序列（可能会更新 KV Cache）
-            x_prop, conf_norm_prop, conf_unnorm_prop = self.proposal_generator.generate(
-                x, idx, block_loc.end, 
-                confidences_norm, confidences_unnorm,
-                kv_cache=kv_cache,
-                verbose=verbose, tokenizer=tokenizer
-            )
+            # Step 3: 生成提议序列，同时获取 q(x'|x) 和 q(x|x')
+            x_prop, conf_norm_prop, conf_unnorm_prop, reverse_conf_norm, reverse_conf_unnorm = \
+                self.proposal_generator.generate(
+                    x, idx, block_loc.end, 
+                    confidences_norm, confidences_unnorm,
+                    kv_cache=kv_cache,
+                    verbose=verbose, tokenizer=tokenizer
+                )
             
-            # Step 4: 计算 MH 接受率（传入 prompt_length 以正确处理边界情况）
+            # Step 4: 计算 MH 接受率
+            # log r = log[p^α(x')] + log[q(x|x')] - log[p^α(x)] - log[q(x'|x)]
             log_r = self._compute_log_acceptance_ratio(
-                confidences_norm, confidences_unnorm,
-                conf_norm_prop, conf_unnorm_prop,
+                confidences_unnorm,      # log p^α(x) - 当前序列的目标分布
+                conf_unnorm_prop,        # log p^α(x') - 提议序列的目标分布
+                conf_norm_prop,          # log q(x'|x) - 提议概率
+                reverse_conf_norm,       # log q(x|x') - 逆向提议概率
                 idx, block_loc.end,
                 prompt_length=prompt_length,
                 verbose=verbose
             )
             
             # Step 5: 接受/拒绝决策
-            # 使用 torch 生成随机数，确保多 GPU 环境下的同步
             accept_prob = min(1.0, np.exp(min(log_r, 0.0)))
             accepted = self._sync_random_uniform(x.device) < accept_prob
             
@@ -1943,10 +2009,10 @@ class MCMCRefinementRunner:
                       f"log_r={log_r:.4f}, accept_prob={accept_prob:.4f}, accepted={accepted}")
             
             if accepted:
-                # 接受提议：保留新的 x 和 KV Cache（不需要回滚）
+                # 接受提议：保留新的 x 和 KV Cache
                 acceptances += 1
                 x = x_prop
-                # 只更新重新采样区域的置信度
+                # 更新重新采样区域的置信度
                 confidences_norm[:, idx:block_loc.end] = conf_norm_prop[:, idx:block_loc.end]
                 confidences_unnorm[:, idx:block_loc.end] = conf_unnorm_prop[:, idx:block_loc.end]
                 
@@ -1978,21 +2044,30 @@ class MCMCRefinementRunner:
         acceptance_rate = acceptances / self.n_mcmc_steps if self.n_mcmc_steps > 0 else 0.0
         return x, confidences_norm, confidences_unnorm, acceptance_rate
     
-    def _compute_log_acceptance_ratio(self, confidences_norm_cur, confidences_unnorm_cur,
-                                       confidences_norm_prop, confidences_unnorm_prop,
+    def _compute_log_acceptance_ratio(self, target_unnorm_cur, target_unnorm_prop,
+                                       proposal_forward, proposal_reverse,
                                        idx, block_end, prompt_length=None, verbose=False):
         """计算 Metropolis-Hastings 接受率的对数
         
+        MH 接受率公式：
+        log r = log[p^α(x')] + log[q(x|x')] - log[p^α(x)] - log[q(x'|x)]
+        
+        其中：
+        - p^α(x) = target_unnorm_cur: 当前序列在目标分布下的概率
+        - p^α(x') = target_unnorm_prop: 提议序列在目标分布下的概率
+        - q(x'|x) = proposal_forward: 从 x 到 x' 的提议概率
+        - q(x|x') = proposal_reverse: 从 x' 到 x 的逆向提议概率
+        
         Parameters
         ----------
-        confidences_norm_cur : torch.Tensor
-            当前序列的归一化置信度
-        confidences_unnorm_cur : torch.Tensor
-            当前序列的非归一化置信度
-        confidences_norm_prop : torch.Tensor
-            提议序列的归一化置信度
-        confidences_unnorm_prop : torch.Tensor
-            提议序列的非归一化置信度
+        target_unnorm_cur : torch.Tensor
+            log p^α(x) - 当前序列在目标分布下的对数概率
+        target_unnorm_prop : torch.Tensor
+            log p^α(x') - 提议序列在目标分布下的对数概率
+        proposal_forward : torch.Tensor
+            log q(x'|x) - 提议概率（提议 token 在当前上下文中的概率）
+        proposal_reverse : torch.Tensor
+            log q(x|x') - 逆向提议概率（原始 token 在提议上下文中的概率）
         idx : int
             重采样起始位置
         block_end : int
@@ -2001,6 +2076,10 @@ class MCMCRefinementRunner:
             Prompt 长度，用于跳过 prompt 区域
         verbose : bool
             是否打印调试信息
+            
+        Returns
+        -------
+        float : log acceptance ratio
         """
         # 计算有效区域（跳过 prompt 区域）
         effective_start = idx
@@ -2014,44 +2093,63 @@ class MCMCRefinementRunner:
             return 0.0
         
         # 提取有效区域的对数概率
-        log_prob_cur_norm_raw = confidences_norm_cur[:, effective_start:block_end].view(-1).tolist()
-        log_prob_cur_unnorm_raw = confidences_unnorm_cur[:, effective_start:block_end].view(-1).tolist()
-        log_prob_prop_norm_raw = confidences_norm_prop[:, effective_start:block_end].view(-1).tolist()
-        log_prob_prop_unnorm_raw = confidences_unnorm_prop[:, effective_start:block_end].view(-1).tolist()
+        log_target_cur_raw = target_unnorm_cur[:, effective_start:block_end].view(-1).tolist()
+        log_target_prop_raw = target_unnorm_prop[:, effective_start:block_end].view(-1).tolist()
+        log_q_forward_raw = proposal_forward[:, effective_start:block_end].view(-1).tolist()
+        log_q_reverse_raw = proposal_reverse[:, effective_start:block_end].view(-1).tolist()
         
         # 调试：统计 -inf 的数量
         region_length = block_end - effective_start
-        cur_norm_inf_count = sum(1 for x in log_prob_cur_norm_raw if x == -np.inf)
-        prop_norm_inf_count = sum(1 for x in log_prob_prop_norm_raw if x == -np.inf)
+        target_cur_inf = sum(1 for x in log_target_cur_raw if x == -np.inf)
+        target_prop_inf = sum(1 for x in log_target_prop_raw if x == -np.inf)
+        q_forward_inf = sum(1 for x in log_q_forward_raw if x == -np.inf)
+        q_reverse_inf = sum(1 for x in log_q_reverse_raw if x == -np.inf)
         
         if verbose:
             print(f"[DEBUG] Effective region: [{effective_start}, {block_end}), length={region_length}")
-            print(f"[DEBUG] cur_norm: {region_length - cur_norm_inf_count}/{region_length} valid")
-            print(f"[DEBUG] prop_norm: {region_length - prop_norm_inf_count}/{region_length} valid")
+            print(f"[DEBUG] target_cur: {region_length - target_cur_inf}/{region_length} valid")
+            print(f"[DEBUG] target_prop: {region_length - target_prop_inf}/{region_length} valid")
+            print(f"[DEBUG] q_forward: {region_length - q_forward_inf}/{region_length} valid")
+            print(f"[DEBUG] q_reverse: {region_length - q_reverse_inf}/{region_length} valid")
         
-        # 过滤 -inf 值
-        log_prob_cur_norm = [x for x in log_prob_cur_norm_raw if x > -np.inf]
-        log_prob_cur_unnorm = [x for x in log_prob_cur_unnorm_raw if x > -np.inf]
-        log_prob_prop_norm = [x for x in log_prob_prop_norm_raw if x > -np.inf]
-        log_prob_prop_unnorm = [x for x in log_prob_prop_unnorm_raw if x > -np.inf]
+        # 过滤 -inf 值（只保留所有四个值都有效的位置）
+        valid_indices = []
+        for i in range(region_length):
+            if (log_target_cur_raw[i] > -np.inf and 
+                log_target_prop_raw[i] > -np.inf and
+                log_q_forward_raw[i] > -np.inf and 
+                log_q_reverse_raw[i] > -np.inf):
+                valid_indices.append(i)
         
         if verbose:
-            print(f"[Acceptance Ratio] After filtering:")
-            print(f"  cur_norm len={len(log_prob_cur_norm)}, sum={sum(log_prob_cur_norm) if log_prob_cur_norm else 0:.4f}")
-            print(f"  prop_norm len={len(log_prob_prop_norm)}, sum={sum(log_prob_prop_norm) if log_prob_prop_norm else 0:.4f}")
+            print(f"[Acceptance Ratio] Valid positions: {len(valid_indices)}/{region_length}")
         
-        # 检查长度匹配
-        if len(log_prob_cur_norm) != len(log_prob_prop_norm):
-            logger.warning(f"[LENGTH MISMATCH] cur_norm={len(log_prob_cur_norm)}, prop_norm={len(log_prob_prop_norm)}")
-            logger.warning(f"  Region: [{effective_start}, {block_end}), cur_inf={cur_norm_inf_count}, prop_inf={prop_norm_inf_count}")
-            return -np.inf  # 拒绝提议
-        
-        # 如果没有有效的置信度，返回 0（接受）
-        if len(log_prob_cur_norm) == 0:
+        # 如果没有有效的位置，返回 0（接受）
+        if len(valid_indices) == 0:
+            if verbose:
+                print(f"[Acceptance Ratio] No valid positions, returning 0.0")
             return 0.0
         
-        # MH 接受率: log r = log[p^α(x') * q(x|x')] - log[p^α(x) * q(x'|x)]
-        log_r = (sum(log_prob_prop_unnorm) + sum(log_prob_cur_norm)
-                - sum(log_prob_cur_unnorm) - sum(log_prob_prop_norm))
+        # 提取有效位置的值
+        log_target_cur = [log_target_cur_raw[i] for i in valid_indices]
+        log_target_prop = [log_target_prop_raw[i] for i in valid_indices]
+        log_q_forward = [log_q_forward_raw[i] for i in valid_indices]
+        log_q_reverse = [log_q_reverse_raw[i] for i in valid_indices]
+        
+        # MH 接受率: log r = log[p^α(x')] + log[q(x|x')] - log[p^α(x)] - log[q(x'|x)]
+        sum_target_prop = sum(log_target_prop)
+        sum_q_reverse = sum(log_q_reverse)
+        sum_target_cur = sum(log_target_cur)
+        sum_q_forward = sum(log_q_forward)
+        
+        log_r = sum_target_prop + sum_q_reverse - sum_target_cur - sum_q_forward
+        
+        if verbose:
+            print(f"[Acceptance Ratio] Components:")
+            print(f"  log p^α(x') = {sum_target_prop:.4f}")
+            print(f"  log q(x|x') = {sum_q_reverse:.4f}")
+            print(f"  log p^α(x)  = {sum_target_cur:.4f}")
+            print(f"  log q(x'|x) = {sum_q_forward:.4f}")
+            print(f"  log r = {log_r:.4f}")
         
         return log_r
