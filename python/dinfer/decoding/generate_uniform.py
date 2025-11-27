@@ -361,6 +361,7 @@ class MCMCDiffusionIteration(DiffusionIteration):
         """
         self.confidences_norm = torch.full(shape, -np.inf, dtype=torch.float32, device=device)
         self.confidences_unnorm = torch.full(shape, -np.inf, dtype=torch.float32, device=device)
+        self.iter_no = 0
 
     def forward(self, model, decoder, x, kv_cache, block, block_loc, block_id):
         """
@@ -1191,6 +1192,12 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
         Whether to use KV Cache acceleration in MCMC proposal generation (default: True)
         When enabled, proposal generation will reuse KV Cache from previous computations,
         and supports snapshot/rollback mechanism for accept/reject decisions.
+    proposal_alpha : float
+        Power parameter for proposal distribution in MCMC (default: 1.0)
+        - proposal_alpha=1.0: standard decoding (same as original sequence generation)
+        - proposal_alpha>1.0: power-scaled decoding for better proposal quality
+        Higher values make the proposal distribution more concentrated on high-probability
+        tokens, potentially improving acceptance rate and sample quality.
     tokenizer : Tokenizer, optional
         Tokenizer for verbose output
     verbose : bool
@@ -1200,6 +1207,7 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
                  enable_mcmc=True, n_mcmc_steps=5,
                  mcmc_alpha=4.0, mcmc_temperature=0.0,
                  mcmc_use_kv_cache=True,
+                 proposal_alpha=1.0,
                  tokenizer=None, verbose=False,
                  early_stop=True, cache_factory=None, 
                  maximum_unroll=4, expected_tpf=8, **kwargs):
@@ -1215,6 +1223,7 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
         self.mcmc_alpha = mcmc_alpha
         self.mcmc_temperature = mcmc_temperature
         self.mcmc_use_kv_cache = mcmc_use_kv_cache
+        self.proposal_alpha = proposal_alpha  # 提议序列的 power scaling 参数
         self.tokenizer = tokenizer
         self.verbose = verbose
         
@@ -1236,7 +1245,8 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
                 decoder=decoder,
                 mcmc_alpha=mcmc_alpha,
                 mcmc_temperature=mcmc_temperature,
-                use_kv_cache=mcmc_use_kv_cache
+                use_kv_cache=mcmc_use_kv_cache,
+                proposal_alpha=proposal_alpha  # 传递 proposal_alpha 给提议生成器
             )
             self.mcmc_runner = MCMCRefinementRunner(
                 proposal_generator=self.proposal_generator,
@@ -1278,9 +1288,10 @@ class BlockMCMCDiffusionLLM(BlockWiseDiffusionLLM):
         # Reset iteration state and initialize confidence tensors
         self.diff_iteration.reset_confidences(x.data.shape, x.device)
         
-        # Reset proposal generator forward count
-        if self.proposal_generator is not None:
-            self.proposal_generator.num_forwards = 0
+        # Note: Do NOT reset num_forwards here to maintain cumulative counting
+        # This is consistent with other DiffusionLLM classes (e.g., BlockWiseDiffusionLLM)
+        # The benchmark code uses prev_forwards = dllm.num_forwards before generate()
+        # and calculates nfe = dllm.num_forwards - prev_forwards after generate()
         
         # Create KV cache
         kv_cache = self.cache_factory.create() if self.cache_factory is not None else None
@@ -1620,40 +1631,92 @@ class MCMCBlockRunner(BlockRunner):
 
 class MCMCProposalGenerator:
     """
-    生成 MCMC 提议序列，支持 KV Cache 加速。
+    生成 MCMC 提议序列，使用 MCMCThresholdParallelDecoder 保持与 Phase 1 一致。
     
     从指定位置开始重新掩码并去噪，生成提议序列及其置信度。
+    使用与原始序列生成相同的解码策略（阈值解码），确保一致性。
     
     Parameters
     ----------
     model : pytorch model
         The diffusion LLM
     decoder : MCMCThresholdParallelDecoder
-        The decoder for token decoding
+        The decoder for token decoding (与 Phase 1 使用相同的解码器)
     mcmc_alpha : float
         Power parameter α for target distribution p^α
     mcmc_temperature : float
-        Temperature for Gumbel noise sampling
+        Temperature for Gumbel noise sampling (未使用，保留接口兼容性)
     use_kv_cache : bool
         Whether to use KV Cache acceleration in proposal generation (default: True)
+    proposal_alpha : float
+        Power parameter for proposal distribution (default: 1.0)
+        - proposal_alpha=1.0: standard decoding (same as original sequence)
+        - proposal_alpha>1.0: power-scaled decoding for better proposal quality
     """
     
-    def __init__(self, model, decoder, mcmc_alpha=4.0, mcmc_temperature=0.0, use_kv_cache=True):
+    def __init__(self, model, decoder, mcmc_alpha=4.0, mcmc_temperature=0.0, use_kv_cache=True, proposal_alpha=1.0):
         self.model = model
         self.decoder = decoder
         self.mcmc_alpha = mcmc_alpha
-        self.mcmc_temperature = mcmc_temperature
+        self.mcmc_temperature = mcmc_temperature  # 保留接口，但实际使用 decoder 的 temperature
         self.use_kv_cache = use_kv_cache
+        self.proposal_alpha = proposal_alpha  # 提议序列的 power scaling 参数
         self.num_forwards = 0
+    
+    def _forward_pass(self, x_prop, idx, block_end, kv_cache, can_use_kv_cache):
+        """
+        前向传播，支持 KV Cache 加速。
+        
+        Parameters
+        ----------
+        x_prop : TokenArray
+            提议序列
+        idx : int
+            块起始位置
+        block_end : int
+            块结束位置
+        kv_cache : KVCache or None
+            KV Cache 管理器
+        can_use_kv_cache : bool
+            是否可以使用 KV Cache
+            
+        Returns
+        -------
+        torch.Tensor : logits for the block [idx, block_end)
+        """
+        block_length = block_end - idx
+        
+        if can_use_kv_cache:
+            past_key_values, replace_position = kv_cache.get_key_values(idx, block_end)
+            
+            if kv_cache.cache_type == 'prefix':
+                output = self.model(
+                    x_prop.data[:, idx:],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    replace_position=replace_position
+                )
+                return output.logits[:, :block_length]
+            else:  # dual
+                output = self.model(
+                    x_prop.data[:, idx:block_end],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    replace_position=replace_position
+                )
+                return output.logits
+        else:
+            return self.model(x_prop.data).logits[:, idx:block_end]
     
     def generate(self, x_current, idx, block_end, confidences_norm, confidences_unnorm, 
                  kv_cache=None, verbose=False, tokenizer=None):
         """
-        从 idx 位置开始重新生成序列，支持 KV Cache 加速。
+        从 idx 位置开始重新生成序列，使用 MCMCThresholdParallelDecoder 解码。
         
-        KV Cache 使用策略:
-        1. 位置 [0, idx) 的 KV 可以复用（这部分序列没有变化）
-        2. 位置 [idx, block_end) 需要重新计算
+        与 Phase 1 使用相同的解码策略，确保一致性：
+        - 使用相同的 decoder（MCMCThresholdParallelDecoder）
+        - 使用相同的 temperature 和 threshold
+        - 使用相同的 mcmc_alpha
         
         Parameters
         ----------
@@ -1678,108 +1741,75 @@ class MCMCProposalGenerator:
         -------
         tuple : (x_prop, conf_norm_prop, conf_unnorm_prop)
         """
-        # Clone current sequence
+        from .parallel_strategy import MCMCThresholdParallelDecoder
+        
+        # Step 1: 克隆当前序列
         x_prop = TokenArray(x_current.prompt, x_current.gen_length, 
                            self.decoder.mask_id, self.decoder.eos_id, x_current.device)
         x_prop.data = x_current.data.clone()
         
-        # Remask from idx to block_end
+        # Step 2: 重新掩码 [idx, block_end) 区域
         x_prop.data[:, idx:block_end] = self.decoder.mask_id
         
-        # Reset confidences for remasked region
+        # Step 3: 重置置信度
         conf_norm_prop = confidences_norm.clone()
         conf_unnorm_prop = confidences_unnorm.clone()
         conf_norm_prop[:, idx:block_end] = -np.inf
         conf_unnorm_prop[:, idx:block_end] = -np.inf
         
-        # Iterative denoising
-        block = x_prop.data[:, idx:block_end]
-        block_mask_index = (block == self.decoder.mask_id)
-        steps = (block == self.decoder.mask_id).sum().item()
+        # Step 4: 检查是否可以使用 KV Cache
+        can_use_kv_cache = (self.use_kv_cache and 
+                           kv_cache is not None and 
+                           kv_cache.past_key_values is not None)
         
-        # 检查是否可以使用 KV Cache
-        # 需要同时满足：1) 启用了 KV Cache 2) kv_cache 不为 None 3) past_key_values 已初始化
-        use_kv_cache = (self.use_kv_cache and 
-                        kv_cache is not None and 
-                        kv_cache.past_key_values is not None)
+        # Step 5: 迭代去噪（使用 MCMCThresholdParallelDecoder，与 Phase 1 一致）
+        block = x_prop.data[:, idx:block_end]
+        initial_masks = (block == self.decoder.mask_id).sum().item()
+        iteration_count = 0
         
         if verbose and tokenizer is not None:
             print(f"[MCMCProposalGenerator] Starting denoising from idx={idx} to {block_end}, "
-                  f"steps={steps}, use_kv_cache={use_kv_cache} (enabled={self.use_kv_cache})")
+                  f"masks={initial_masks}, use_kv_cache={can_use_kv_cache}")
         
-        if steps > 0:
-            num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
-            block_length = block_end - idx
+        while (block == self.decoder.mask_id).sum() > 0:
+            iteration_count += 1
             
-            for i in range(steps):
-                # Forward pass with optional KV Cache
-                if use_kv_cache:
-                    # 使用 KV Cache 加速
-                    past_key_values, replace_position = kv_cache.get_key_values(idx, block_end)
-                    
-                    if kv_cache.cache_type == 'prefix':
-                        # 前缀缓存模式：从 idx 开始的所有 token
-                        output = self.model(
-                            x_prop.data[:, idx:],
-                            past_key_values=past_key_values,
-                            use_cache=True,
-                            replace_position=replace_position
-                        )
-                        logits = output.logits[:, :block_length]
-                    else:
-                        # 双向缓存模式：只处理当前块
-                        output = self.model(
-                            x_prop.data[:, idx:block_end],
-                            past_key_values=past_key_values,
-                            use_cache=True,
-                            replace_position=replace_position
-                        )
-                        logits = output.logits
-                else:
-                    # 无 KV Cache，完整前向传播
-                    logits = self.model(x_prop.data).logits[:, idx:block_end]
+            # 前向传播获取 logits
+            logits = self._forward_pass(x_prop, idx, block_end, kv_cache, can_use_kv_cache)
+            self.num_forwards += 1
+            
+            # 使用 MCMCThresholdParallelDecoder 解码
+            # 关键区别：提议序列使用 proposal_alpha 进行 power-scaled 解码
+            if isinstance(self.decoder, MCMCThresholdParallelDecoder):
+                conf_norm_block, conf_unnorm_block = self.decoder.decode(
+                    logits, idx, block_end, x_prop,
+                    mcmc_alpha=self.mcmc_alpha,
+                    proposal_alpha=self.proposal_alpha  # 使用 power-scaled 解码生成更高质量的提议
+                )
                 
-                self.num_forwards += 1
-                
-                # Compute dual log probabilities
-                log_p_norm = torch.nn.functional.log_softmax(logits, dim=-1)
-                log_p_unnorm = torch.nn.functional.log_softmax(self.mcmc_alpha * logits, dim=-1)
-                
-                # Sample with Gumbel noise
-                logits_with_noise = add_gumbel_noise_power(logits, alpha=1.0, temperature=self.mcmc_temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1)
-                
-                # Get log probs for selected tokens
-                x0_logp_norm = torch.gather(log_p_norm, -1, x0.unsqueeze(-1)).squeeze(-1)
-                x0_logp_unnorm = torch.gather(log_p_unnorm, -1, x0.unsqueeze(-1)).squeeze(-1)
-                
-                # Compute confidence for remasking
-                p = torch.nn.functional.softmax(logits, dim=-1)
-                x0_p = torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1)
-                
-                # Select tokens to transfer
-                mask_index = (block == self.decoder.mask_id)
-                x0 = torch.where(mask_index, x0, block)
-                confidence = torch.where(mask_index, x0_p, -np.inf)
-                
-                transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-                for j in range(confidence.shape[0]):
-                    _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
-                    transfer_index[j, select_index] = True
-                
-                # Update proposal sequence and confidences
-                if transfer_index.any():
-                    x_prop.data[:, idx:block_end][transfer_index] = x0[transfer_index]
-                    conf_norm_prop[:, idx:block_end][transfer_index] = x0_logp_norm[transfer_index].float()
-                    conf_unnorm_prop[:, idx:block_end][transfer_index] = x0_logp_unnorm[transfer_index].float()
-                
-                block = x_prop.data[:, idx:block_end]
-                
-                if verbose and tokenizer is not None:
-                    prompt_length = x_prop.prompt.shape[1]
-                    current_output = x_prop.data[:, prompt_length:block_end]
-                    decoded_proposal = tokenizer.batch_decode(current_output, skip_special_tokens=True)
-                    print(f"[MCMCProposalGenerator] Step {i+1}/{steps}: {decoded_proposal}")
+                # 更新置信度（只更新有效的位置）
+                if conf_norm_block is not None:
+                    mask_updated = conf_norm_block > -np.inf
+                    if mask_updated.any():
+                        conf_norm_prop[:, idx:block_end][mask_updated] = conf_norm_block[mask_updated]
+                        conf_unnorm_prop[:, idx:block_end][mask_updated] = conf_unnorm_block[mask_updated]
+            else:
+                # 回退到标准解码器
+                self.decoder.decode(logits, idx, block_end, x_prop)
+            
+            # 更新 block 引用（关键：确保使用最新的数据）
+            block = x_prop.data[:, idx:block_end]
+            
+            if verbose and tokenizer is not None:
+                remaining_masks = (block == self.decoder.mask_id).sum().item()
+                prompt_length = x_prop.prompt.shape[1]
+                current_output = x_prop.data[:, prompt_length:block_end]
+                decoded_proposal = tokenizer.batch_decode(current_output, skip_special_tokens=True)
+                print(f"[MCMCProposalGenerator] Iteration {iteration_count}, "
+                      f"masks: {remaining_masks}, output: {decoded_proposal}")
+        
+        if verbose and tokenizer is not None:
+            print(f"[MCMCProposalGenerator] Completed in {iteration_count} iterations")
         
         return x_prop, conf_norm_prop, conf_unnorm_prop
 
@@ -1802,6 +1832,36 @@ class MCMCRefinementRunner:
     def __init__(self, proposal_generator, n_mcmc_steps=5):
         self.proposal_generator = proposal_generator
         self.n_mcmc_steps = n_mcmc_steps
+    
+    def _sync_random_int(self, low, high, device):
+        """
+        生成同步的随机整数，确保多 GPU 环境下所有 rank 使用相同的随机数。
+        
+        使用 torch 在指定设备上生成随机数，然后通过 all_reduce 同步。
+        """
+        # 在 GPU 上生成随机数
+        rand_tensor = torch.randint(low, high + 1, (1,), device=device, dtype=torch.long)
+        
+        # 如果是分布式环境，同步随机数
+        if torch.distributed.is_initialized():
+            # 使用 rank 0 的随机数广播给所有 rank
+            torch.distributed.broadcast(rand_tensor, src=0)
+        
+        return rand_tensor.item()
+    
+    def _sync_random_uniform(self, device):
+        """
+        生成同步的 [0, 1) 均匀分布随机数，确保多 GPU 环境下所有 rank 使用相同的随机数。
+        """
+        # 在 GPU 上生成随机数
+        rand_tensor = torch.rand(1, device=device, dtype=torch.float32)
+        
+        # 如果是分布式环境，同步随机数
+        if torch.distributed.is_initialized():
+            # 使用 rank 0 的随机数广播给所有 rank
+            torch.distributed.broadcast(rand_tensor, src=0)
+        
+        return rand_tensor.item()
     
     def refine(self, x, block_loc, confidences_norm, confidences_unnorm, 
                kv_cache=None, verbose=False, tokenizer=None):
@@ -1847,7 +1907,8 @@ class MCMCRefinementRunner:
         
         for mcmc_step in range(self.n_mcmc_steps):
             # Step 1: 随机选择重采样位置 (必须在生成区域内)
-            idx = random.randint(effective_block_start, block_loc.end - 1)
+            # 使用 torch 生成随机数，确保多 GPU 环境下的同步
+            idx = self._sync_random_int(effective_block_start, block_loc.end - 1, x.device)
             
             # Step 2: 创建 KV Cache 快照（如果使用 KV Cache）
             snapshot = None
@@ -1873,8 +1934,9 @@ class MCMCRefinementRunner:
             )
             
             # Step 5: 接受/拒绝决策
+            # 使用 torch 生成随机数，确保多 GPU 环境下的同步
             accept_prob = min(1.0, np.exp(min(log_r, 0.0)))
-            accepted = np.random.rand() < accept_prob
+            accepted = self._sync_random_uniform(x.device) < accept_prob
             
             if verbose and tokenizer is not None:
                 print(f"\n[MCMC Step {mcmc_step+1}/{self.n_mcmc_steps}] idx={idx}, "
