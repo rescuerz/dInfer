@@ -699,6 +699,12 @@ class OlmoeMoE(nn.Module):
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # Reshape num_experts_per_tok to match hidden_states
+        # If num_experts_per_tok is [B, L], flatten it to [B*L]
+        if num_experts_per_tok is not None and num_experts_per_tok.dim() > 1:
+            num_experts_per_tok = num_experts_per_tok.view(-1)
+
         # router_logits: (num_tokens, n_experts)
         original_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
@@ -737,7 +743,7 @@ class OlmoeDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         replace_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        
+        num_experts_per_tok: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -793,7 +799,8 @@ class OlmoeDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         shared_expert_states = hidden_states
 
-        hidden_states = self.mlp(hidden_states.clone())
+        # 将 num_experts_per_tok 传递给 MLP 层
+        hidden_states = self.mlp(hidden_states.clone(), num_experts_per_tok=num_experts_per_tok)
 
         if hasattr(self, "shared_expert"):
             hidden_states = hidden_states + self.shared_expert(shared_expert_states)
@@ -984,6 +991,7 @@ class OlmoeModel(OlmoePreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         replace_position: Optional[torch.LongTensor] = None,
+        num_experts_per_tok: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, MoeModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
@@ -1045,6 +1053,7 @@ class OlmoeModel(OlmoePreTrainedModel):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 replace_position=replace_position,
+                num_experts_per_tok=num_experts_per_tok,
             )
 
             hidden_states = layer_outputs[0]
@@ -1217,6 +1226,7 @@ class FusedOlmoeForCausalLM(OlmoePreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         replace_position: Optional[torch.LongTensor] = None,
         num_logits_to_keep: int = 0,
+        num_experts_per_tok: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, MoeCausalLMOutputWithPast]:
         r"""
         Args:
@@ -1272,6 +1282,7 @@ class FusedOlmoeForCausalLM(OlmoePreTrainedModel):
             return_dict=return_dict,
             cache_position=cache_position,
             replace_position=replace_position,
+            num_experts_per_tok=num_experts_per_tok,
         )
 
         hidden_states = outputs.last_hidden_state

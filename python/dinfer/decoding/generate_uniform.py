@@ -9,6 +9,39 @@ from .utils import calculate_op_num
 
 logger = logging.getLogger(__name__)
 
+def update_expert_count(
+    remask_count: torch.Tensor,
+    num_experts_per_tok: torch.Tensor,
+    growth_strategy: str,
+    max_num_experts: int,
+    initial_num_experts: int
+) -> torch.Tensor:
+    """根据remask次数和增长策略更新每个token的专家数
+
+    Args:
+        remask_count: 每个token被remask的次数, shape [B, L]
+        num_experts_per_tok: 当前每个token的专家数, shape [B, L]
+        growth_strategy: 增长策略 'linear' 或 'exponential'
+        max_num_experts: 最大专家数
+        initial_num_experts: 初始专家数
+
+    Returns:
+        更新后的专家数, shape [B, L]
+    """
+    if growth_strategy == 'linear':
+        # 线性增长: initial_num_experts + remask_count
+        new_experts = initial_num_experts + remask_count
+    elif growth_strategy == 'exponential':
+        # 指数增长: initial_num_experts * (2^remask_count)
+        new_experts = initial_num_experts * (2 ** remask_count)
+    else:
+        raise ValueError(f"Unknown growth strategy: {growth_strategy}")
+
+    # 限制在最大专家数内
+    new_experts = torch.clamp(new_experts, min=initial_num_experts, max=max_num_experts)
+
+    return new_experts.long()
+
 class DiffusionLLM:
     """ Diffusion LLM inference
     """
@@ -298,6 +331,137 @@ class BaseDiffusionIteration(DiffusionIteration):
         self.iter_no += 1
         return cache_update_kv, logits
 
+class AdaptiveMoEDiffusionIteration(BaseDiffusionIteration):
+    """支持动态专家激活的 Diffusion Iteration
+
+    Args:
+        growth_strategy: 专家数增长策略 ('linear' 或 'exponential')
+        max_num_experts: 最大专家数
+        initial_num_experts: 初始专家数
+        update_interval: 多少步更新一次专家数 (默认8)
+        verbose: 是否记录详细信息 (默认False)
+    """
+    def __init__(self, growth_strategy='linear', max_num_experts=8,
+                 initial_num_experts=1, update_interval=8, verbose=False):
+        super().__init__()
+        self.growth_strategy = growth_strategy
+        self.max_num_experts = max_num_experts
+        self.initial_num_experts = initial_num_experts
+        self.update_interval = update_interval
+        self.verbose = verbose
+
+        # 这些将在generate中被设置
+        self.num_experts_per_tok = None
+        self.remask_count = None
+
+        # 日志记录
+        self.step_logs = []  # 存储每一步的详细信息
+
+    def forward(self, model, decoder, x, kv_cache, block, block_loc, block_id):
+        """Decode tokens in a forward run on a block with adaptive MoE.
+
+        Parameters
+        ----------
+        model : pytorch model
+            The diffusion LLM
+        decoder : ParallelDecoder
+            The decoder
+        x : TokenArray
+            The input tokens. The decoded tokens are also stored in this array.
+        kv_cache: KVCache
+            The KV-cache
+        block : torch.Tensor
+            The input IDs of the tokens in the current decoding block.
+        block_loc : BlockLoc
+            The start and the end of the location of the decoding block.
+        block_id : int
+            The block ID
+        """
+        cache_update_kv = None
+        mask_index = (x.data == decoder.mask_id)
+
+        # Update KV-cache
+        if kv_cache is not None and kv_cache.require_update(self.iter_no, block_loc.start, block_loc.end):
+            output = model(x.data, use_cache=True, num_experts_per_tok=self.num_experts_per_tok)
+            cache_update_kv = output.past_key_values
+            self.num_forwards += 1
+            # use the generated output to decode.
+            decoder.decode(output.logits[:, block_loc.start:block_loc.end], block_loc.start, block_loc.end, x)
+            # update KV-cache
+            kv_cache.update(output.past_key_values)
+            self.cache_updates += 1
+
+        if kv_cache is None:
+            logits = model(x.data, num_experts_per_tok=self.num_experts_per_tok).logits[:, block_loc.start:block_loc.end]
+        elif kv_cache.cache_type == 'prefix':
+            past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
+            logits = model(x[:, block_loc.start:], past_key_values=past_key_values, use_cache=True,
+                    replace_position=replace_position, num_experts_per_tok=self.num_experts_per_tok[:, block_loc.start:] if self.num_experts_per_tok is not None else None).logits
+            block_length = block_loc.end - block_loc.start
+            logits = logits[:, :block_length]
+        else:
+            past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
+            # cache position is the position between current_block_start and current_block_end
+            logits = model(block, past_key_values=past_key_values, use_cache=True,
+                    replace_position=replace_position,
+                    num_experts_per_tok=self.num_experts_per_tok[:, block_loc.start:block_loc.end] if self.num_experts_per_tok is not None else None).logits
+
+        # Decode tokens
+        old_block = block.clone()
+        decoder.decode(logits, block_loc.start, block_loc.end, x)
+        new_block = x.data[:, block_loc.start:block_loc.end]
+
+        # 识别哪些token被解码了 (从mask变成了实际token)
+        transfer_index = (old_block == decoder.mask_id) & (new_block != decoder.mask_id)
+
+        # 记录当前步骤的详细信息
+        if self.verbose:
+            step_log = {
+                'step': self.num_forwards,
+                'block_id': block_id,
+                'block_range': (block_loc.start, block_loc.end),
+                'num_decoded': transfer_index.sum().item(),
+                'num_remaining_mask': (new_block == decoder.mask_id).sum().item(),
+                # 记录当前块的专家配置
+                'experts_per_tok_in_block': self.num_experts_per_tok[:, block_loc.start:block_loc.end].clone().cpu() if self.num_experts_per_tok is not None else None,
+                # 记录remask计数
+                'remask_count_in_block': self.remask_count[:, block_loc.start:block_loc.end].clone().cpu() if self.remask_count is not None else None,
+                # 记录解码后的序列
+                'sequence_snapshot': x.data.clone().cpu(),
+                # 记录全局专家配置
+                'num_experts_per_tok_global': self.num_experts_per_tok.clone().cpu() if self.num_experts_per_tok is not None else None,
+            }
+            self.step_logs.append(step_log)
+
+        # 每 update_interval 步更新专家数
+        if self.num_forwards % self.update_interval == 0 and self.num_experts_per_tok is not None:
+            # 当前仍为MASK的token (包括刚被解码的，因为我们需要为所有MASK token更新专家数)
+            still_mask_block = (new_block == decoder.mask_id)
+
+            # 更新remask_count和专家数
+            if still_mask_block.any():
+                still_mask_indices = torch.zeros_like(x.data, dtype=torch.bool)
+                still_mask_indices[:, block_loc.start:block_loc.end] = still_mask_block
+                
+                # 更新remask_count
+                self.remask_count[still_mask_indices] += 1
+
+                # 更新专家数
+                new_expert_count = update_expert_count(
+                    self.remask_count[still_mask_indices],
+                    self.num_experts_per_tok[still_mask_indices],
+                    self.growth_strategy,
+                    self.max_num_experts,
+                    self.initial_num_experts
+                )
+                
+                # 应用新的专家数
+                self.num_experts_per_tok[still_mask_indices] = new_expert_count
+
+        self.num_forwards += 1
+        self.iter_no += 1
+        return cache_update_kv, logits
+
 class BlockDiffusionIteration:
     """ An implementation of block diffusion iteration to decode.
     """
@@ -440,16 +604,40 @@ class BlockWiseDiffusionLLM(DiffusionLLM):
         The factory class that generates the iterator on the input token array.
     cache_factory : KVCacheFactory (optional)
         The KV-cache factory that generates a kv-cache for LLM.
+    enable_adaptive_moe : bool (optional)
+        Whether to enable adaptive MoE expert activation
+    growth_strategy : str (optional)
+        Expert growth strategy for adaptive MoE ('linear' or 'exponential')
+    max_num_experts : int (optional)
+        Maximum number of experts per token
+    initial_num_experts : int (optional)
+        Initial number of experts per token
+    update_interval : int (optional)
+        Update expert count every N steps
     """
-    def __init__(self, model, decoder, iterator_factory, early_stop=True, cache_factory=None, maximum_unroll=4, expected_tpf=8, use_shift=False):
+    def __init__(self, model, decoder, iterator_factory, early_stop=True, cache_factory=None,
+                 maximum_unroll=4, expected_tpf=8, use_shift=False,
+                 enable_adaptive_moe=False, growth_strategy='linear',
+                 max_num_experts=8, initial_num_experts=1, update_interval=8, verbose=False):
         self.model = model
         self.cache_factory = cache_factory
         self.decoder = decoder
         self.iterator_factory = iterator_factory
-        if use_shift:
+        self.enable_adaptive_moe = enable_adaptive_moe
+
+        if enable_adaptive_moe:
+            self.diff_iteration = AdaptiveMoEDiffusionIteration(
+                growth_strategy=growth_strategy,
+                max_num_experts=max_num_experts,
+                initial_num_experts=initial_num_experts,
+                update_interval=update_interval,
+                verbose=verbose  # 传递 verbose 参数
+            )
+        elif use_shift:
             self.diff_iteration = ShiftDiffusionIteration()
         else:
             self.diff_iteration = BaseDiffusionIteration()
+
         self.block_decoder = BlockRunner(self.diff_iteration, early_stop, maximum_unroll, expected_tpf)
         
 
@@ -471,6 +659,30 @@ class BlockWiseDiffusionLLM(DiffusionLLM):
         # We need to reset iter_no at the beginning of generating a sequence.
         self.diff_iteration.iter_no = 0
         kv_cache = self.cache_factory.create() if self.cache_factory is not None else None
+
+        # 初始化动态专家激活
+        if self.enable_adaptive_moe and isinstance(self.diff_iteration, AdaptiveMoEDiffusionIteration):
+            batch_size = prompt.shape[0]
+            total_len = x.total_length
+            prompt_len = prompt.shape[1]
+
+            # 初始化 num_experts_per_tok: [B, L]
+            num_experts_per_tok = torch.full(
+                (batch_size, total_len),
+                self.diff_iteration.initial_num_experts,
+                dtype=torch.long,
+                device=self.model.device
+            )
+            # prompt 部分使用最大专家数
+            num_experts_per_tok[:, :prompt_len] = self.diff_iteration.max_num_experts
+
+            # 初始化 remask_count: [B, L]
+            remask_count = torch.zeros(batch_size, total_len, dtype=torch.long, device=self.model.device)
+
+            # 设置到 diff_iteration
+            self.diff_iteration.num_experts_per_tok = num_experts_per_tok
+            self.diff_iteration.remask_count = remask_count
+
         for block_id, (block_loc, block) in enumerate(it):
             self.decoder.block_init(block, block_id)
             decode_compl = self.block_decoder.decode(self.model, self.decoder, x, kv_cache, block, block_loc, block_id)
