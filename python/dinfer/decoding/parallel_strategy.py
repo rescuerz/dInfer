@@ -298,6 +298,9 @@ class ThresholdParallelDecoder(ParallelDecoder):
 
     def decode(self, logits, block_start, block_end, x, iter_threshold = None):
         """ Decode the logits in a block.
+
+        Returns:
+            transfer_index: Boolean tensor indicating which tokens were decoded in this step
         """
         if iter_threshold is None:
             iter_threshold = self.threshold
@@ -310,6 +313,8 @@ class ThresholdParallelDecoder(ParallelDecoder):
         transfer_index = torch.logical_and(transfer_index, mask_index)
         assert transfer_index.dtype == torch.bool
         x[:, block_start:block_end] = torch.where(transfer_index, x0, curr_x)
+
+        return transfer_index
 
 class CreditThresholdParallelDecoder(ThresholdParallelDecoder):
     """ This decoder deocdes tokens in parallel based on a threshold + credit.
