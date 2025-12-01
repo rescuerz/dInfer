@@ -70,11 +70,13 @@ class EvalConfig:
     use_compile: bool = True
     use_bd: bool = False
     use_shift: bool = False
-    # MCMC 相关配置
-    n_mcmc_steps: int = 3
-    mcmc_alpha: float = 4.0
-    mcmc_temperature: float = 0.9
-    mcmc_use_kv_cache: bool = False
+    # MCMC 相关配置 (与 BlockMCMCDiffusionLLM 默认值保持一致)
+    enable_mcmc: bool = True           # 是否启用 MCMC 精炼
+    n_mcmc_steps: int = 5              # MCMC 迭代步数 (BlockMCMCDiffusionLLM 默认: 5)
+    mcmc_alpha: float = 4.0            # 目标分布 p^α 的 power 参数
+    mcmc_temperature: float = 0.0      # 提议分布温度 (BlockMCMCDiffusionLLM 默认: 0.0)
+    mcmc_use_kv_cache: bool = True     # 是否使用 KV Cache 加速 (BlockMCMCDiffusionLLM 默认: True)
+    proposal_alpha: float = 1.0        # 提议分布的 power 参数 (BlockMCMCDiffusionLLM 默认: 1.0)
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -127,12 +129,14 @@ class DInferEvalHarness(LM):
         use_bd = False,
         prefix_look = 0,
         after_look = 0,
-        use_shift = True,
-        # MCMC 相关参数
-        n_mcmc_steps = 3,
+        use_shift = False,
+        # MCMC 相关参数 (与 BlockMCMCDiffusionLLM 默认值保持一致)
+        enable_mcmc = True,
+        n_mcmc_steps = 5,
         mcmc_alpha = 4.0,
-        mcmc_temperature = 0.9,
-        mcmc_use_kv_cache = False,
+        mcmc_temperature = 0.0,
+        mcmc_use_kv_cache = True,
+        proposal_alpha = 1.0,
         **kwargs
     ):
 
@@ -170,12 +174,15 @@ class DInferEvalHarness(LM):
         self.kwargs = kwargs
         self.use_shift = use_shift
         # MCMC 相关参数
+        self.enable_mcmc = enable_mcmc
         self.n_mcmc_steps = n_mcmc_steps
         self.mcmc_alpha = mcmc_alpha
         self.mcmc_temperature = mcmc_temperature
         self.mcmc_use_kv_cache = mcmc_use_kv_cache
+        self.proposal_alpha = proposal_alpha
 
-        if "moe" or "mini" in model_path:
+        model_path_lower = model_path.lower()
+        if "moe" in model_path_lower or "mini" in model_path_lower:
             self.mask_id = 156895  # LLaDA MoE/mini的mask ID
             self.eos_id = 156892   # LLaDA MoE/mini的EOS ID
             self.is_moe = True
@@ -208,11 +215,11 @@ class DInferEvalHarness(LM):
                                       mask_id=self.mask_id, eos_id=self.eos_id)
         if parallel == 'dp':
             self.device= torch.device(device)
-            if "moe" or "mini" in model_path:
+            if "moe" in model_path_lower or "mini" in model_path_lower:
                 # MoE或mini模型：需要初始化专家并行（EP）
                 # 注意：这里初始化TP但不实际使用，只是为了启用EP
                 os.environ['MASTER_ADDR'] = 'localhost'
-                os.environ['MASTER_PORT'] = '12345'+str(self.rank)
+                os.environ['MASTER_PORT'] = '1234'+str(self.rank)
                 distributed.init_distributed_environment(1, 0, 'env://', 0, 'nccl')
                 distributed.initialize_model_parallel(1, backend='nccl')
                 parallel_config = ParallelConfig(enable_expert_parallel = True)
@@ -221,7 +228,7 @@ class DInferEvalHarness(LM):
                     print("EP Enabled:", vllm_config.parallel_config.enable_expert_parallel)
                     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
                     # load model
-                    if 'moe' in model_path:
+                    if 'moe' in model_path_lower:
                         model = LLaDAMoeModelLM(config=config).eval()
                         model.load_weights(self.model_path, torch_dtype=torch.bfloat16)
                     else:
@@ -259,14 +266,29 @@ class DInferEvalHarness(LM):
                     decoder=decoder,
                     iterator_factory=BlockIteratorFactory(True),
                     cache_factory=cache_factory,
-                    enable_mcmc=True,
+                    enable_mcmc=self.enable_mcmc,
                     n_mcmc_steps=self.n_mcmc_steps,
                     mcmc_alpha=self.mcmc_alpha,
                     mcmc_temperature=self.mcmc_temperature,
                     mcmc_use_kv_cache=self.mcmc_use_kv_cache,
+                    proposal_alpha=self.proposal_alpha,
+                    use_shift=self.use_shift,
                     tokenizer=self.tokenizer,
                     verbose=False
                 )
+                print("=" * 60)
+                print(f"[Model Created] BlockMCMCDiffusionLLM")
+                print(f"  parallel_decoding: {self.parallel_decoding}")
+                print(f"  enable_mcmc: {self.enable_mcmc}")
+                print(f"  n_mcmc_steps: {self.n_mcmc_steps}")
+                print(f"  mcmc_alpha: {self.mcmc_alpha}")
+                print(f"  mcmc_temperature: {self.mcmc_temperature}")
+                print(f"  mcmc_use_kv_cache: {self.mcmc_use_kv_cache}")
+                print(f"  proposal_alpha: {self.proposal_alpha}")
+                print(f"  use_shift: {self.use_shift}")
+                print(f"  cache: {self.cache}")
+                print(f"  threshold: {self.threshold}")
+                print("=" * 60)
             elif not self.use_bd:
                 if self.cont_weight>0:
                     if use_sw:
@@ -280,6 +302,13 @@ class DInferEvalHarness(LM):
                             prefix_look=self.prefix_look, after_look=self.after_look, warmup_steps=self.warmup_times)
                     else:
                         self.dllm = BlockWiseDiffusionLLM(self.model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=self.use_shift)
+                        print("=" * 60)
+                        print(f"[Model Created] BlockWiseDiffusionLLM")
+                        print(f"  parallel_decoding: {self.parallel_decoding}")
+                        print(f"  use_shift: {self.use_shift}")
+                        print(f"  cache: {self.cache}")
+                        print(f"  threshold: {self.threshold}")
+                        print("=" * 60)
             else:
                 self.dllm = BlockDiffusionLLM(self.model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True)
             
@@ -610,39 +639,54 @@ class DInferEvalHarness(LM):
                     cache_factory=None
 
                 if args.parallel_decoding == 'mcmc_threshold':
-                    print("BlockMCMCDiffusionLLM")
                     dllm = BlockMCMCDiffusionLLM(
                         model=model,
                         decoder=decoder,
                         iterator_factory=BlockIteratorFactory(True),
                         cache_factory=cache_factory,
-                        enable_mcmc=True,
+                        enable_mcmc=args.enable_mcmc,
                         n_mcmc_steps=args.n_mcmc_steps,
                         mcmc_alpha=args.mcmc_alpha,
                         mcmc_temperature=args.mcmc_temperature,
                         mcmc_use_kv_cache=args.mcmc_use_kv_cache,
+                        proposal_alpha=args.proposal_alpha,
+                        use_shift=args.use_shift,
                         tokenizer=tokenizer,
                         verbose=False
                     )
+                    print("=" * 60)
+                    print(f"[Model Created] BlockMCMCDiffusionLLM")
+                    print(f"  parallel_decoding: {args.parallel_decoding}")
+                    print(f"  enable_mcmc: {args.enable_mcmc}")
+                    print(f"  n_mcmc_steps: {args.n_mcmc_steps}")
+                    print(f"  mcmc_alpha: {args.mcmc_alpha}")
+                    print(f"  mcmc_temperature: {args.mcmc_temperature}")
+                    print(f"  mcmc_use_kv_cache: {args.mcmc_use_kv_cache}")
+                    print(f"  proposal_alpha: {args.proposal_alpha}")
+                    print(f"  use_shift: {args.use_shift}")
+                    print(f"  cache: {args.cache}")
+                    print(f"  threshold: {args.threshold}")
+                    print("=" * 60)
                 elif not args.use_bd:
                     if args.cont_weight>0:
                         if use_sw:
-                            print("IterSmoothWithVicinityCacheDiffusionLLM")
                             dllm = IterSmoothWithVicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,
                                 cont_weight=args.cont_weight, prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
                         else:
-                            print("IterSmoothDiffusionLLM")
                             dllm = IterSmoothDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, cont_weight=args.cont_weight)
                     else:
                         if use_sw:
-                            print("VicinityCacheDiffusionLLM")
                             dllm = VicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
                         else:
-                            print("BlockWiseDiffusionLLM")
-                            print(f"use_shift:{args.use_shift}")
                             dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=args.use_shift)
+                            print("=" * 60)
+                            print(f"[Model Created] BlockWiseDiffusionLLM")
+                            print(f"  parallel_decoding: {args.parallel_decoding}")
+                            print(f"  use_shift: {args.use_shift}")
+                            print(f"  cache: {args.cache}")
+                            print(f"  threshold: {args.threshold}")
+                            print("=" * 60)
                 else:
-                    print("BlockDiffusionLLM")
                     dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True)
 
                 warmup_cudagraph(rank, device, dllm, args.gen_len, block_length, args.batch_size)
@@ -819,7 +863,35 @@ class DInferEvalHarness(LM):
             procs = []
             answers = []
             gpus = [int(gpu) for gpu in str(self.gpus).split('-')]
-            args = {"gpu": self.gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "n_mcmc_steps": self.n_mcmc_steps, "mcmc_alpha": self.mcmc_alpha, "mcmc_temperature": self.mcmc_temperature, "mcmc_use_kv_cache": self.mcmc_use_kv_cache}
+            args = {
+                "gpu": self.gpus,
+                "batch_size": self.batch_size,
+                "model_name": self.model_path,
+                "gen_len": self.gen_length,
+                "block_length": self.block_length,
+                "prefix_look": self.prefix_look,
+                "after_look": self.after_look,
+                "warmup_times": self.warmup_times,
+                "low_threshold": self.low_threshold,
+                "threshold": self.threshold,
+                "cont_weight": self.cont_weight,
+                "use_credit": self.use_credit,
+                "cache": self.cache,
+                "parallel_decoding": self.parallel_decoding,
+                "tp_size": self.tp_size,
+                "save_path": self.save_path,
+                "use_cudagraph": self.use_cudagraph,
+                "use_compile": self.use_compile,
+                "use_bd": self.use_bd,
+                "use_shift": self.use_shift,
+                # MCMC 相关参数
+                "enable_mcmc": self.enable_mcmc,
+                "n_mcmc_steps": self.n_mcmc_steps,
+                "mcmc_alpha": self.mcmc_alpha,
+                "mcmc_temperature": self.mcmc_temperature,
+                "mcmc_use_kv_cache": self.mcmc_use_kv_cache,
+                "proposal_alpha": self.proposal_alpha,
+            }
             args = EvalConfig(**args)
             args.tp_size = len(gpus)
             args.use_tp = args.tp_size > 1
@@ -846,52 +918,78 @@ class DInferEvalHarness(LM):
         return answers
 
 
+class TeeOutput:
+    """同时输出到终端和文件的类"""
+    def __init__(self, file_path, mode='a'):
+        self.terminal = sys.stdout
+        self.file_path = file_path
+        self.mode = mode
+        self.file = None
+        
+    def open(self):
+        os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+        self.file = open(self.file_path, self.mode, encoding='utf-8')
+        # 写入分隔符和时间戳
+        self.file.write('\n' + '='*80 + '\n')
+        self.file.write(f'Timestamp: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+        self.file.write('='*80 + '\n\n')
+        self.file.write(f'Command: {" ".join(sys.argv)}\n\n')
+        self.file.flush()
+        
+    def write(self, message):
+        self.terminal.write(message)
+        if self.file is not None:
+            self.file.write(message)
+            self.file.flush()  # 实时刷新，确保不丢失输出
+            
+    def flush(self):
+        self.terminal.flush()
+        if self.file is not None:
+            self.file.flush()
+            
+    def close(self):
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+
+
 if __name__ == "__main__":
     import sys
-    from io import StringIO
     
     set_seed(1234)
     
-    # 捕获标准输出
-    old_stdout = sys.stdout
-    sys.stdout = captured_output = StringIO()
+    # 从命令行参数中提取 save_dir
+    save_dir = None
+    if '--output_path' in sys.argv:
+        output_path_idx = sys.argv.index('--output_path')
+        if output_path_idx + 1 < len(sys.argv):
+            save_dir = sys.argv[output_path_idx + 1]
+    
+    # 如果没有找到 --output_path，尝试从 --model_args 中的 save_dir 提取
+    if save_dir is None and '--model_args' in sys.argv:
+        model_args_idx = sys.argv.index('--model_args')
+        if model_args_idx + 1 < len(sys.argv):
+            model_args = sys.argv[model_args_idx + 1]
+            if 'save_dir=' in model_args:
+                save_dir = model_args.split('save_dir=')[1].split(',')[0]
+    
+    # 设置 Tee 输出（同时输出到终端和文件）
+    tee = None
+    if save_dir is not None:
+        log_file = os.path.join(save_dir, 'log.txt')
+        tee = TeeOutput(log_file, mode='a')
+        tee.open()
+        sys.stdout = tee
+        # 同时重定向 stderr 以捕获警告和错误
+        sys.stderr = tee
     
     try:
         cli_evaluate()
     finally:
-        sys.stdout = old_stdout
-        output_text = captured_output.getvalue()
-        print(output_text)
-        
-        # 从命令行参数中提取 output_path
-        save_dir = None
-        if '--output_path' in sys.argv:
-            output_path_idx = sys.argv.index('--output_path')
-            if output_path_idx + 1 < len(sys.argv):
-                save_dir = sys.argv[output_path_idx + 1]
-        
-        # 如果没有找到 --output_path，尝试从 --model_args 中的 save_dir 提取
-        if save_dir is None and '--model_args' in sys.argv:
-            model_args_idx = sys.argv.index('--model_args')
-            if model_args_idx + 1 < len(sys.argv):
-                model_args = sys.argv[model_args_idx + 1]
-                if 'save_dir=' in model_args:
-                    save_dir = model_args.split('save_dir=')[1].split(',')[0]
-        
-        # 保存结果到 result.txt
-        if save_dir is not None:
-            result_file = os.path.join(save_dir, 'log.txt')
-            os.makedirs(save_dir, exist_ok=True)
-            
-            with open(result_file, 'a', encoding='utf-8') as f:
-                f.write('\n' + '='*80 + '\n')
-                f.write(f'Timestamp: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
-                f.write('='*80 + '\n\n')
-                f.write('Configuration:\n')
-                f.write(f'  Command: {" ".join(sys.argv)}\n\n')
-                f.write('Results:\n')
-                f.write(output_text)
-                f.write('\n')
-            
-            print(f'\nResults saved to: {result_file}')
+        if tee is not None:
+            # 恢复标准输出
+            sys.stdout = tee.terminal
+            sys.stderr = tee.terminal
+            tee.close()
+            print(f'\nAll output saved to: {log_file}')
     
