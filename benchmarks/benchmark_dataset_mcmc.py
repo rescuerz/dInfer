@@ -12,8 +12,8 @@ from vllm.forward_context import set_forward_context
 import json
 from dinfer.model import LLaDAMoeModelLM, LLaDAModelLM, LLaDA2MoeModelLM
 from dinfer import BlockIteratorFactory, KVCacheFactory
-from dinfer import ThresholdParallelDecoder,CreditThresholdParallelDecoder, HierarchyDecoder
-from dinfer import BlockWiseDiffusionLLM, IterSmoothDiffusionLLM, VicinityCacheDiffusionLLM, IterSmoothWithVicinityCacheDiffusionLLM, BlockDiffusionLLM
+from dinfer import ThresholdParallelDecoder,CreditThresholdParallelDecoder, HierarchyDecoder, MCMCThresholdParallelDecoder
+from dinfer import BlockWiseDiffusionLLM, IterSmoothDiffusionLLM, VicinityCacheDiffusionLLM, IterSmoothWithVicinityCacheDiffusionLLM, BlockDiffusionLLM, BlockMCMCDiffusionLLM
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 def setup_distributed(rank, world_size):
@@ -204,6 +204,8 @@ def main(world_size, rank, gpu_id, args):
                 decoder = CreditThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=mask_id, eos_id=eos_id)
             else:
                 decoder = ThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=mask_id, eos_id=eos_id)
+        elif args.parallel_decoding == 'mcmc_threshold':
+            decoder = MCMCThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=mask_id, eos_id=eos_id)
         else:
             decoder = HierarchyDecoder(temperature=0, threshold=args.threshold, low_threshold=args.low_threshold, mask_id=mask_id, eos_id=eos_id)
         use_sw = args.prefix_look > 0 or args.after_look > 0 or args.warmup_times > 0
@@ -213,30 +215,45 @@ def main(world_size, rank, gpu_id, args):
         else:
             cache_factory=None
 
-        # 根据配置选择扩散语言模型类型
-        if not args.use_bd:
-            # 不使用块扩散（Block Diffusion）
-            if args.cont_weight>0:
-                # 使用连续性权重的迭代平滑
-                if use_sw:
-                    # 带滑动窗口和邻近缓存的迭代平滑扩散模型
-                    dllm = IterSmoothWithVicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,
-                        cont_weight=args.cont_weight, prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
-                else:
-                    # 标准迭代平滑扩散模型
-                    dllm = IterSmoothDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, cont_weight=args.cont_weight)
-            else:
-                # 不使用连续性权重
-                if use_sw:
-                    # 带邻近缓存的扩散模型
-                    dllm = VicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,
-                        prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
-                else:
-                    # 标准块级扩散模型
-                    dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=args.use_shift)
+        if args.parallel_decoding == 'mcmc_threshold':
+            dllm = BlockMCMCDiffusionLLM(
+                model=model, 
+                decoder=decoder, 
+                iterator_factory=BlockIteratorFactory(True),
+                cache_factory=cache_factory,  # 支持 KV Cache
+                enable_mcmc=True,
+                n_mcmc_steps=args.n_mcmc_steps,
+                mcmc_alpha=args.mcmc_alpha,
+                mcmc_temperature=args.mcmc_temperature,
+                mcmc_use_kv_cache=args.mcmc_use_kv_cache,
+                tokenizer=tokenizer,
+                verbose=False
+            )
         else:
-            # 使用块扩散模型
-            dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=cache_factory, early_stop=True)
+            # 根据配置选择扩散语言模型类型
+            if not args.use_bd:
+                # 不使用块扩散（Block Diffusion）
+                if args.cont_weight>0:
+                    # 使用连续性权重的迭代平滑
+                    if use_sw:
+                        # 带滑动窗口和邻近缓存的迭代平滑扩散模型
+                        dllm = IterSmoothWithVicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,
+                            cont_weight=args.cont_weight, prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
+                    else:
+                        # 标准迭代平滑扩散模型
+                        dllm = IterSmoothDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, cont_weight=args.cont_weight)
+                else:
+                    # 不使用连续性权重
+                    if use_sw:
+                        # 带邻近缓存的扩散模型
+                        dllm = VicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,
+                            prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
+                    else:
+                        # 标准块级扩散模型
+                        dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=args.use_shift)
+            else:
+                # 使用块扩散模型
+                dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=cache_factory, early_stop=True)
         
         # 执行CUDA图预热
         batch_size = args.batch_size
@@ -290,9 +307,26 @@ def main(world_size, rank, gpu_id, args):
                 padded_gen_len = padded_gen_lens[i]
                 inner_start = time.time()  # 记录单个批次开始时间
                 prev_forwards = dllm.num_forwards  # 记录之前的前向传播次数
+                
+                # 记录 MCMC 相关的前向传播次数（用于计算当前 sample 的增量）
+                prev_diff_forwards = 0
+                prev_prop_forwards = 0
+                if args.parallel_decoding == 'mcmc_threshold' and hasattr(dllm, 'diff_iteration') and hasattr(dllm, 'proposal_generator'):
+                    if dllm.proposal_generator is not None:
+                        prev_diff_forwards = dllm.diff_iteration.num_forwards
+                        prev_prop_forwards = dllm.proposal_generator.num_forwards
+                
                 out = dllm.generate(input_ids, gen_length=min_padded_length, block_length=block_length)
                 
                 nfe = dllm.num_forwards - prev_forwards  # 计算本批次的前向传播次数（Number of Function Evaluations）
+                
+                # 计算当前 sample 的 MCMC 前向传播增量
+                sample_diff_forwards = 0
+                sample_prop_forwards = 0
+                if args.parallel_decoding == 'mcmc_threshold' and hasattr(dllm, 'diff_iteration') and hasattr(dllm, 'proposal_generator'):
+                    if dllm.proposal_generator is not None:
+                        sample_diff_forwards = dllm.diff_iteration.num_forwards - prev_diff_forwards
+                        sample_prop_forwards = dllm.proposal_generator.num_forwards - prev_prop_forwards
                 inner_stop = time.time()  # 记录单个批次结束时间
                 sample_time = inner_stop - inner_start  # 计算本批次耗时
                 
@@ -315,7 +349,17 @@ def main(world_size, rank, gpu_id, args):
                 fps = nfe/sample_time
 
                 if rank == 0:
+                    # 基础性能指标
                     print(f'[iter {i:4d}]nfe={nfe:4d}, token number={batch_token_number:4d}, fps={fps:4.2f},tpf={tpf:2.2f}, tps={tps:4.2f}')
+                    
+                    # MCMC 特有的性能指标
+                    if args.parallel_decoding == 'mcmc_threshold' and hasattr(dllm, 'diff_iteration') and hasattr(dllm, 'proposal_generator'):
+                        if dllm.proposal_generator is not None:
+                            diff_forwards = dllm.diff_iteration.num_forwards
+                            prop_forwards = dllm.proposal_generator.num_forwards
+                            # 打印当前 sample 的增量和累积值
+                            print(f'         [MCMC] sample: diff={sample_diff_forwards}, prop={sample_prop_forwards} | total: diff={diff_forwards}, prop={prop_forwards}')
+                    
                     # 在前5个批次打印生成的文本样例
                     if wi==0 and i<5:
                         for j in range(input_ids.shape[0]):
@@ -403,6 +447,11 @@ if __name__ == '__main__':
     parser.add_argument('--model_type', type=str, default='llada2',
         help="llada2 (for llada2-mini or llada2-flash) | llada_moe (for llada-moe) | llada (for llada or llada-1.5)")
     parser.add_argument('--config', type=int, default=0)
+    # MCMC 相关参数
+    parser.add_argument('--n_mcmc_steps', type=int, default=3, help='Number of MCMC steps per block')
+    parser.add_argument('--mcmc_alpha', type=float, default=4.0, help='MCMC alpha (power parameter)')
+    parser.add_argument('--mcmc_temperature', type=float, default=0.9, help='MCMC temperature')
+    parser.add_argument('--mcmc_use_kv_cache', action='store_true', help='Enable KV cache in MCMC proposal generation')
     args = parser.parse_args()
 
     if args.config == 1:
@@ -526,6 +575,59 @@ if __name__ == '__main__':
         args.warmup_times = 0
         args.use_bd=True
         args.block_length=32
+
+    # MCMC 配置预设
+    elif args.config == 20:
+        # MCMC 基础配置（无 KV Cache）
+        args.cache = ''
+        args.parallel_decoding = 'mcmc_threshold'
+        args.prefix_look = 0
+        args.after_look = 0
+        args.threshold = 0.9
+        args.warmup_times = 0
+        args.n_mcmc_steps = 3
+        args.mcmc_alpha = 4.0
+        args.mcmc_temperature = 0.9
+        args.mcmc_use_kv_cache = False
+
+    elif args.config == 21:
+        # MCMC + dual KV Cache
+        args.cache = 'dual'
+        args.parallel_decoding = 'mcmc_threshold'
+        args.prefix_look = 0
+        args.after_look = 0
+        args.threshold = 0.9
+        args.warmup_times = 0
+        args.n_mcmc_steps = 3
+        args.mcmc_alpha = 4.0
+        args.mcmc_temperature = 0.9
+        args.mcmc_use_kv_cache = True
+
+    elif args.config == 22:
+        # MCMC + prefix KV Cache
+        args.cache = 'prefix'
+        args.parallel_decoding = 'mcmc_threshold'
+        args.prefix_look = 0
+        args.after_look = 0
+        args.threshold = 0.9
+        args.warmup_times = 0
+        args.n_mcmc_steps = 5
+        args.mcmc_alpha = 4.0
+        args.mcmc_temperature = 0.9
+        args.mcmc_use_kv_cache = True
+
+    elif args.config == 23:
+        # MCMC 高精度配置（更多 MCMC 步数，更高 alpha）
+        args.cache = 'dual'
+        args.parallel_decoding = 'mcmc_threshold'
+        args.prefix_look = 0
+        args.after_look = 0
+        args.threshold = 0.95
+        args.warmup_times = 0
+        args.n_mcmc_steps = 5
+        args.mcmc_alpha = 6.0
+        args.mcmc_temperature = 0.9
+        args.mcmc_use_kv_cache = True
         
 
     print(f"The input args are listed as follows: {args}")
