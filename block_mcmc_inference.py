@@ -39,13 +39,13 @@ python block_mcmc_inference.py --use_kv_cache --kv_cache_type dual --no_mcmc_kv_
 python block_mcmc_inference.py --proposal_alpha 4.0 --verbose
 
 # 8. 完整配置示例（推荐生产环境）
-python block_mcmc_inference.py \\
-    --use_kv_cache --kv_cache_type dual \\
-    --enable_mcmc --n_mcmc_steps 3 \\
-    --mcmc_alpha 4.0 --proposal_alpha 1.0 \\
-    --mcmc_use_kv_cache \\
-    --gen_length 256 --block_length 32 \\
-    --verbose
+python block_mcmc_inference.py \
+    --use_kv_cache --kv_cache_type dual \
+    --enable_mcmc --n_mcmc_steps 3 \
+    --mcmc_alpha 4.0 --proposal_alpha 4.0 \
+    --mcmc_use_kv_cache \
+    --gen_length 256 --block_length 32 > a.txt 2>&1
+    
 
 ================================================================================
 """
