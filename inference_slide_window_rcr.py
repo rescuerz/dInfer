@@ -35,11 +35,11 @@ def parse_args():
                         help='Sliding window size for confidence history')
     parser.add_argument('--decline_threshold', type=float, default=0.1,
                         help='Threshold for confidence decline detection')
-    parser.add_argument('--gen_length', type=int, default=1024,
+    parser.add_argument('--gen_length', type=int, default=256,
                         help='Maximum generation length')
     parser.add_argument('--block_length', type=int, default=64,
                         help='Block length for diffusion')
-    parser.add_argument('--temperature', type=float, default=0.0,
+    parser.add_argument('--temperature', type=float, default=0.9,
                         help='Temperature for sampling')
     parser.add_argument('--prompt', type=str, default=None,
                         help='Custom prompt (optional)')
@@ -98,7 +98,9 @@ def main():
             window_size=args.window_size,
             decline_threshold=args.decline_threshold,
             mask_id=mask_id,
-            eos_id=eos_id
+            eos_id=eos_id,
+            debug=True,  # Enable debug mode
+            tokenizer=tokenizer  # Pass tokenizer for debug output
         )
 
     print("========== Step 5: Create Diffusion LLM ==========")
@@ -113,7 +115,7 @@ def main():
     if args.prompt:
         prompt = args.prompt
     else:
-        prompt = "Lily can run 12 kilometers per hour for 4 hours. After that, she can run 6 kilometers per hour. How many kilometers can she run in 8 hours?"
+        prompt = "The vending machine sells drinks for 80 cents each. However, it gives you a 20-cent refund for each empty bottle you return. James has 2 dollars (200 cents). Assuming he can buy a drink, drink it, and immediately return the bottle for the refund (and repeat), how many drinks can he drink in total?"
     
     messages = [{"role": "user", "content": prompt}]
     prompt_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
@@ -124,6 +126,10 @@ def main():
     print(f"Input length: {input_ids.shape[1]} tokens")
 
     print("========== Step 7: Generate ==========")
+    # Reset statistics before generation
+    if args.decoder == 'slide_window_rcr':
+        decoder.reset_stats()
+    
     start_time = time.time()
     res = dllm.generate(input_ids, gen_length=args.gen_length, block_length=args.block_length)
     end_time = time.time()
@@ -136,6 +142,15 @@ def main():
     print(f"Generated tokens: {num_generated}")
     print(f"Tokens per second: {tokens_per_second:.2f}")
     print(f"Number of forward passes: {dllm.num_forwards}")
+    
+    # Print remask statistics for SlideWindowRCRDecoder
+    if args.decoder == 'slide_window_rcr':
+        stats = decoder.get_stats()
+        print(f"Remask statistics:")
+        print(f"  Low confidence remask (conf < {args.low_threshold}): {stats['remask_low_conf_count']}")
+        print(f"  Declining threshold remask (decline > {args.decline_threshold}): {stats['remask_declining_count']}")
+        print(f"  Declining consecutive remask (every step decreasing): {stats['remask_consecutive_declining_count']}")
+        print(f"  Total remask count: {stats['total_remask_count']}")
 
     print("========== Step 8: Decode Output ==========")
     output_text = tokenizer.decode(res[0, input_ids.shape[1]:], skip_special_tokens=False)

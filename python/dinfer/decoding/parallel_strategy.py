@@ -530,7 +530,7 @@ class SlideWindowRCRDecoder(ParallelDecoder):
     
     def __init__(self, temperature, threshold=0.9, medium_threshold=0.8, 
                  low_threshold=0.62, window_size=3, decline_threshold=0.1,
-                 mask_id=126336, eos_id=126081, use_float64=False):
+                 mask_id=126336, eos_id=126081, use_float64=False, debug=False, tokenizer=None):
         super().__init__(temperature, 'low_confidence', mask_id)
         self.threshold = threshold
         self.medium_threshold = medium_threshold
@@ -539,17 +539,56 @@ class SlideWindowRCRDecoder(ParallelDecoder):
         self.decline_threshold = decline_threshold
         self.eos_id = eos_id
         self.use_float64 = use_float64
+        self.debug = debug
+        self.tokenizer = tokenizer
         
         # Confidence history: list of tensors, each shape [1, seq_len]
         # -inf means the position is mask or not yet tracked
         self.confidence_history = []
         self.block_seq_len = None
+        self.decode_step = 0  # Track decode step for debug
+        
+        # Statistics for remask
+        self.remask_low_conf_count = 0  # Tokens remasked due to low confidence (< low_threshold)
+        self.remask_declining_count = 0  # Tokens remasked due to declining confidence trend (threshold-based)
+        self.remask_consecutive_declining_count = 0  # Tokens remasked due to consecutive declining
+        self.total_remask_count = 0  # Total number of tokens remasked during decoding
     
     def block_init(self, block_x, block_id):
         """ Initialize for a new block. Clear confidence history.
         """
         self.confidence_history = []
         self.block_seq_len = block_x.shape[1]
+        # Track which positions are prompt (non-mask at block init)
+        # These positions should never be remasked
+        self.prompt_positions = (block_x != self.mask_id)
+        self.decode_step = 0  # Reset step counter for new block
+    
+    def reset_stats(self):
+        """ Reset statistics. Call this before starting a new generation.
+        """
+        self.remask_low_conf_count = 0    # Tokens remasked due to low confidence (< low_threshold)
+        self.remask_declining_count = 0   # Tokens remasked due to declining confidence trend (threshold-based)
+        self.remask_consecutive_declining_count = 0  # Tokens remasked due to consecutive declining
+        self.total_remask_count = 0       # Total = low_conf + declining + consecutive_declining
+    
+    def get_stats(self):
+        """ Get decoding statistics.
+        
+        Returns
+        -------
+        dict : Statistics including remask breakdown
+            - remask_low_conf_count: tokens remasked because confidence < low_threshold
+            - remask_declining_count: tokens remasked because confidence < medium_threshold AND decline > threshold
+            - remask_consecutive_declining_count: tokens remasked because confidence is consecutively declining
+            - total_remask_count: total tokens remasked
+        """
+        return {
+            'remask_low_conf_count': self.remask_low_conf_count,
+            'remask_declining_count': self.remask_declining_count,
+            'remask_consecutive_declining_count': self.remask_consecutive_declining_count,
+            'total_remask_count': self.total_remask_count
+        }
     
     def _compute_confidence(self, logits, curr_x):
         """ Compute confidence for all positions.
@@ -588,41 +627,83 @@ class SlideWindowRCRDecoder(ParallelDecoder):
         
         return x0, confidence
     
-    def _is_declining(self, pos_idx):
+    def _is_declining(self, pos_idx, curr_conf):
         """ Check if confidence at position pos_idx is declining over the window.
         
-        Returns True if:
-        - Window is full (len >= window_size)
-        - First element is not -inf
-        - decline = history[0] - history[-1] > decline_threshold
+        This method constructs a window of (window_size-1) historical values + current value,
+        then checks two conditions:
+        1. Threshold-based: decline from first to last exceeds decline_threshold
+        2. Consecutive declining: every step is strictly decreasing (no -inf allowed)
+        
+        Returns
+        -------
+        tuple (is_declining: bool, decline_type: str or None)
+            - is_declining: True if any declining condition is met
+            - decline_type: 'threshold' or 'consecutive' or None
         """
-        if len(self.confidence_history) < self.window_size:
-            return False
+        # Need at least (window_size - 1) historical steps to form a full window with current
+        if len(self.confidence_history) < self.window_size - 1:
+            return False, None
         
-        # Get history for this position from the last window_size steps
-        history = [self.confidence_history[-(self.window_size - i)][0, pos_idx].item() 
-                   for i in range(self.window_size)]
+        # Build history: take last (window_size - 1) steps + current confidence
+        history = []
+        start_idx = max(0, len(self.confidence_history) - (self.window_size - 1))
+        for i in range(start_idx, len(self.confidence_history)):
+            history.append(self.confidence_history[i][0, pos_idx].item())
+        history.append(curr_conf)  # Add current step's confidence
         
-        # If first is -inf, cannot compute valid decline
-        if history[0] == float('-inf'):
-            return False
+        # If we don't have enough history, don't trigger remask
+        if len(history) < self.window_size:
+            return False, None
         
-        decline = history[0] - history[-1]
-        return decline > self.decline_threshold
+        # Check 1: Threshold-based declining (allows -inf in middle, but not at start)
+        if history[0] != float('-inf'):
+            decline = history[0] - history[-1]
+            if decline > self.decline_threshold:
+                return True, 'threshold'
+        
+        # Check 2: Consecutive declining (no -inf allowed, every step must decrease)
+        has_inf = any(h == float('-inf') for h in history)
+        if not has_inf:
+            is_consecutive = all(history[i] > history[i + 1] for i in range(len(history) - 1))
+            if is_consecutive:
+                return True, 'consecutive'
+        
+        return False, None
     
     def _compute_remask_index(self, confidence, mask_index):
         """ Compute which decoded positions should be remasked.
         
-        Remask conditions (only for decoded positions):
+        Remask conditions (only for decoded positions that are NOT prompt):
         1. confidence < low_threshold (absolute low)
-        2. confidence < medium_threshold AND _is_declining (trend-based)
+        2. confidence < medium_threshold AND _is_declining (trend-based or consecutive)
+        
+        Note: Prompt positions (non-mask at block_init) are never remasked.
+        
+        Returns
+        -------
+        remask_index : Tensor
+            Boolean tensor indicating positions to remask
+        remask_low_conf_indices : list
+            Indices of positions remasked due to low confidence
+        remask_declining_indices : list
+            Indices of positions remasked due to threshold-based declining trend
+        remask_consecutive_declining_indices : list
+            Indices of positions remasked due to consecutive declining
         """
         B, L = confidence.shape
         remask_index = torch.zeros_like(mask_index, dtype=torch.bool)
+        remask_low_conf_indices = []
+        remask_declining_indices = []
+        remask_consecutive_declining_indices = []
         
         for j in range(L):
             # Only consider decoded positions (not mask)
             if mask_index[0, j]:
+                continue
+            
+            # Never remask prompt positions
+            if self.prompt_positions[0, j]:
                 continue
             
             curr_conf = confidence[0, j].item()
@@ -630,14 +711,20 @@ class SlideWindowRCRDecoder(ParallelDecoder):
             # Condition 1: absolute low confidence
             if curr_conf < self.low_threshold:
                 remask_index[0, j] = True
+                remask_low_conf_indices.append(j)
                 continue
             
             # Condition 2: medium confidence + declining trend
             if curr_conf < self.medium_threshold:
-                if self._is_declining(j):
+                is_declining, decline_type = self._is_declining(j, curr_conf)
+                if is_declining:
                     remask_index[0, j] = True
+                    if decline_type == 'threshold':
+                        remask_declining_indices.append(j)
+                    elif decline_type == 'consecutive':
+                        remask_consecutive_declining_indices.append(j)
         
-        return remask_index
+        return remask_index, remask_low_conf_indices, remask_declining_indices, remask_consecutive_declining_indices
     
     def _ensure_progress(self, transfer_index, confidence, remask_cnt):
         """ Ensure at least one token is decoded per step.
@@ -698,15 +785,40 @@ class SlideWindowRCRDecoder(ParallelDecoder):
         B, L = logits.shape[0], logits.shape[1]
         assert B == 1, "SlideWindowRCRDecoder only supports batch_size=1"
         
-        curr_x = x[:, block_start:block_end]
+        curr_x = x[:, block_start:block_end].clone()
         mask_index = (curr_x == self.mask_id)
         assert mask_index.shape[1] == logits.shape[1]
+        
+        # Increment step counter at the beginning
+        self.decode_step += 1
         
         # 1. Compute confidence for all positions
         x0, confidence = self._compute_confidence(logits, curr_x)
         
+        if self.debug:
+            print(f"\n[DEBUG] ===== Step {self.decode_step} =====")
+            print(f"[DEBUG] block=[{block_start}, {block_end}], mask_count={mask_index.sum().item()}")
+        
         # 2. Compute remask index (only for decoded positions)
-        remask_index = self._compute_remask_index(confidence, mask_index)
+        remask_index, remask_low_conf_indices, remask_declining_indices, remask_consecutive_declining_indices = self._compute_remask_index(confidence, mask_index)
+        
+        if self.debug and remask_index.any():
+            print(f"[DEBUG] REMASK CANDIDATES: total={remask_index.sum().item()}")
+            if remask_low_conf_indices:
+                # Show confidence values for low_conf remask
+                low_conf_info = [(idx + block_start, f'{confidence[0, idx].item():.4f}') for idx in remask_low_conf_indices]
+                print(f"[DEBUG]   low_conf (conf < {self.low_threshold}): {len(remask_low_conf_indices)} positions")
+                print(f"[DEBUG]     indices(absolute) with conf: {low_conf_info}")
+            if remask_declining_indices:
+                # Show confidence values for threshold-based declining remask
+                declining_info = [(idx + block_start, f'{confidence[0, idx].item():.4f}') for idx in remask_declining_indices]
+                print(f"[DEBUG]   declining_threshold (conf < {self.medium_threshold} AND decline > {self.decline_threshold}): {len(remask_declining_indices)} positions")
+                print(f"[DEBUG]     indices(absolute) with conf: {declining_info}")
+            if remask_consecutive_declining_indices:
+                # Show confidence values for consecutive declining remask
+                consecutive_info = [(idx + block_start, f'{confidence[0, idx].item():.4f}') for idx in remask_consecutive_declining_indices]
+                print(f"[DEBUG]   declining_consecutive (conf < {self.medium_threshold} AND every step decreasing): {len(remask_consecutive_declining_indices)} positions")
+                print(f"[DEBUG]     indices(absolute) with conf: {consecutive_info}")
         
         # 3. Compute new mask region (original mask + remask)
         mask_new = torch.logical_or(mask_index, remask_index)
@@ -717,7 +829,7 @@ class SlideWindowRCRDecoder(ParallelDecoder):
         
         # Ensure denoised token is not mask_id
         mask_new_and_valid = mask_new & (x0 != self.mask_id)
-        x0_safe = torch.where(mask_new_and_valid, x0, curr_x)
+        
         confidence_for_transfer = torch.where(mask_new_and_valid, confidence, torch.tensor(float('-inf'), device=confidence.device))
         
         # Apply threshold: transfer if confidence >= threshold
@@ -727,17 +839,102 @@ class SlideWindowRCRDecoder(ParallelDecoder):
         
         # 5. Ensure progress: at least decode one token per step
         remask_cnt = remask_index.sum()
+        transfer_before_ensure = transfer_index.sum().item()
         self._ensure_progress(transfer_index, confidence_for_transfer, remask_cnt)
+        transfer_after_ensure = transfer_index.sum().item()
+        
+        # Analyze transfer breakdown
+        # - transfer from original mask positions (new decoding)
+        # - transfer from remask positions (remask invalidated / rescued)
+        transfer_from_mask = torch.logical_and(transfer_index, mask_index)
+        transfer_from_remask = torch.logical_and(transfer_index, remask_index)
+        
+        transfer_from_mask_count = transfer_from_mask.sum().item()
+        transfer_from_remask_count = transfer_from_remask.sum().item()
+        
+        transfer_from_mask_indices = [idx + block_start for idx in transfer_from_mask[0].nonzero(as_tuple=True)[0].tolist()]
+        transfer_from_remask_indices = [idx + block_start for idx in transfer_from_remask[0].nonzero(as_tuple=True)[0].tolist()]
+        
+        if self.debug:
+            print(f"[DEBUG] TRANSFER DECISION:")
+            print(f"[DEBUG]   threshold={iter_threshold}, actual_threshold={actual_threshold.item():.4f}")
+            print(f"[DEBUG]   transfer_count: {transfer_before_ensure} (by threshold) -> {transfer_after_ensure} (after ensure_progress)")
+            print(f"[DEBUG]   breakdown: from_mask={transfer_from_mask_count}, from_remask={transfer_from_remask_count}")
+            print(f"[DEBUG]     from_mask indices(absolute)={transfer_from_mask_indices}")
+            if transfer_from_remask_count > 0:
+                # Show which remask positions were "rescued" (transferred back instead of remasked)
+                remask_rescued_info = [(idx + block_start, f'{confidence[0, idx].item():.4f}') for idx in transfer_from_remask[0].nonzero(as_tuple=True)[0].tolist()]
+                print(f"[DEBUG]     from_remask indices(absolute) with conf (RESCUED): {remask_rescued_info}")
         
         # 6. Compute final remask (remask but not transferred)
         final_remask = torch.logical_and(remask_index, torch.logical_not(transfer_index))
         
-        # 7. Update x0 for final_remask positions
-        x0[final_remask] = self.mask_id
+        # Update remask statistics - separate by type
+        final_remask_low_conf = torch.zeros_like(final_remask)
+        final_remask_declining = torch.zeros_like(final_remask)
+        final_remask_consecutive = torch.zeros_like(final_remask)
+        for idx in remask_low_conf_indices:
+            if final_remask[0, idx]:
+                final_remask_low_conf[0, idx] = True
+        for idx in remask_declining_indices:
+            if final_remask[0, idx]:
+                final_remask_declining[0, idx] = True
+        for idx in remask_consecutive_declining_indices:
+            if final_remask[0, idx]:
+                final_remask_consecutive[0, idx] = True
         
-        # 8. Apply transfer: only transfer within mask_new region
+        final_remask_low_conf_count = final_remask_low_conf.sum().item()
+        final_remask_declining_count = final_remask_declining.sum().item()
+        final_remask_consecutive_count = final_remask_consecutive.sum().item()
+        final_remask_count = final_remask.sum().item()
+        
+        self.remask_low_conf_count += final_remask_low_conf_count
+        self.remask_declining_count += final_remask_declining_count
+        self.remask_consecutive_declining_count += final_remask_consecutive_count
+        self.total_remask_count += final_remask_count
+        
+        if self.debug:
+            if remask_index.any():
+                final_remask_indices = [idx + block_start for idx in final_remask[0].nonzero(as_tuple=True)[0].tolist()]
+                print(f"[DEBUG] FINAL REMASK (actually remasked):")
+                print(f"[DEBUG]   total={final_remask_count}, low_conf={final_remask_low_conf_count}, declining_threshold={final_remask_declining_count}, declining_consecutive={final_remask_consecutive_count}")
+                print(f"[DEBUG]   indices(absolute)={final_remask_indices}")
+                if transfer_from_remask_count > 0:
+                    print(f"[DEBUG]   NOTE: {transfer_from_remask_count}/{remask_index.sum().item()} remask candidates were RESCUED (not remasked)")
+
+        # 7. Prepare the output tokens
+        # For mask positions that are transferred: use x0 (predicted token)
+        # For remask positions that are transferred: keep current token (rescued)
+        # For final_remask positions: use mask_id
+        output_tokens = curr_x.clone()
+        
+        # Transfer from mask positions: use predicted x0
+        output_tokens[transfer_from_mask] = x0[transfer_from_mask]
+        
+        # Transfer from remask positions: keep current token (already in output_tokens)
+        # No action needed, they keep their current value
+        
+        # Final remask positions: set to mask_id
+        output_tokens[final_remask] = self.mask_id
+        
+        # 8. Apply transfer: only update positions in mask_new that are transferred
         transfer_index = torch.logical_and(transfer_index, mask_new)
-        x[:, block_start:block_end] = torch.where(transfer_index, x0, curr_x)
+        x[:, block_start:block_end] = torch.where(transfer_index, output_tokens, curr_x)
+        
+        # Also apply final_remask (set to mask_id)
+        x[:, block_start:block_end][final_remask] = self.mask_id
         
         # 9. Update confidence history (after all decisions)
         self._update_history(confidence, curr_x, transfer_index, final_remask)
+        
+        # Debug: print step summary
+        if self.debug:
+            remaining_mask = (x[:, block_start:block_end] == self.mask_id).sum().item()
+            print(f"[DEBUG] STEP RESULT:")
+            print(f"[DEBUG]   new_decoded={transfer_from_mask_count} at indices(absolute)={transfer_from_mask_indices}")
+            print(f"[DEBUG]   remaining_mask={remaining_mask}, total_remask_so_far={self.total_remask_count}")
+            
+            if self.tokenizer is not None:
+                block_tokens = x[:, block_start:block_end][0].tolist()
+                block_text = self.tokenizer.decode(block_tokens, skip_special_tokens=False)
+                print(f"[DEBUG] block text: {repr(block_text)}")

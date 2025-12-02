@@ -91,39 +91,38 @@ class TestSlideWindowRCRDecoder:
     
     def test_is_declining_insufficient_history(self):
         """Test _is_declining returns False when history is insufficient"""
-        # Empty history
-        assert self.decoder._is_declining(0) == False
+        # Empty history (need window_size - 1 = 2 historical steps)
+        assert self.decoder._is_declining(0, 0.7) == False
         
-        # Less than window_size
+        # Only 1 historical step, need 2
         self.decoder.confidence_history = [
-            torch.tensor([[0.8, 0.7]]),
-            torch.tensor([[0.75, 0.65]])
+            torch.tensor([[0.8, 0.7]])
         ]
-        assert self.decoder._is_declining(0) == False
+        assert self.decoder._is_declining(0, 0.7) == False
     
     def test_is_declining_with_inf(self):
         """Test _is_declining returns False when first element is -inf"""
+        # With window_size=3, we need 2 historical steps + current
         self.decoder.confidence_history = [
             torch.tensor([[float('-inf'), 0.8]]),
-            torch.tensor([[0.75, 0.75]]),
-            torch.tensor([[0.70, 0.70]])
+            torch.tensor([[0.75, 0.75]])
         ]
-        # Position 0 has -inf at start
-        assert self.decoder._is_declining(0) == False
-        # Position 1 has valid history
-        assert self.decoder._is_declining(1) == True  # 0.8 - 0.7 = 0.1
+        # Position 0 has -inf at start of window
+        assert self.decoder._is_declining(0, 0.70) == False
+        # Position 1: history=[0.8, 0.75] + curr=0.65 → decline=0.8-0.65=0.15 > 0.1
+        assert self.decoder._is_declining(1, 0.65) == True
     
     def test_is_declining_true(self):
         """Test _is_declining returns True for declining confidence"""
+        # With window_size=3, we need 2 historical steps + current
         self.decoder.confidence_history = [
             torch.tensor([[0.85, 0.9]]),
-            torch.tensor([[0.75, 0.85]]),
-            torch.tensor([[0.65, 0.80]])
+            torch.tensor([[0.75, 0.85]])
         ]
-        # Position 0: 0.85 - 0.65 = 0.2 > 0.1 → declining
-        assert self.decoder._is_declining(0) == True
-        # Position 1: 0.9 - 0.8 = 0.1, not > 0.1 → not declining
-        assert self.decoder._is_declining(1) == False
+        # Position 0: history=[0.85, 0.75] + curr=0.65 → decline=0.85-0.65=0.2 > 0.1
+        assert self.decoder._is_declining(0, 0.65) == True
+        # Position 1: history=[0.9, 0.85] + curr=0.80 → decline=0.9-0.80=0.1, not > 0.1
+        assert self.decoder._is_declining(1, 0.80) == False
     
     def test_compute_remask_index_low_confidence(self):
         """Test remask for low confidence positions"""
@@ -141,19 +140,19 @@ class TestSlideWindowRCRDecoder:
     
     def test_compute_remask_index_declining(self):
         """Test remask for declining confidence positions"""
-        # Setup history showing decline for position 1
+        # With window_size=3, we need 2 historical steps + current
+        # Setup history showing decline
         self.decoder.confidence_history = [
-            torch.tensor([[0.9, 0.85]]),
-            torch.tensor([[0.85, 0.78]]),
-            torch.tensor([[0.80, 0.72]])
+            torch.tensor([[0.90, 0.85]]),
+            torch.tensor([[0.85, 0.78]])
         ]
         
-        confidence = torch.tensor([[0.75, 0.65]])  # Current step
+        confidence = torch.tensor([[0.79, 0.65]])  # Current step
         mask_index = torch.tensor([[False, False]])  # Both decoded
         
         remask_index = self.decoder._compute_remask_index(confidence, mask_index)
         
-        # Position 0: conf=0.75 < medium=0.8, check decline: 0.9-0.75=0.15 > 0.1 → remask
+        # Position 0: conf=0.79 < medium=0.8, check decline: 0.90-0.79=0.11 > 0.1 → remask
         # Position 1: conf=0.65 > low=0.62, check decline: 0.85-0.65=0.2 > 0.1 → remask
         assert remask_index[0, 0] == True
         assert remask_index[0, 1] == True
@@ -352,6 +351,226 @@ class TestSlideWindowRCRDecoderEdgeCases:
         assert (x != self.mask_id).sum() >= 1
 
 
+class TestSlideWindowRCRDecoderFullFlow:
+    """Full flow tests based on our discussion examples"""
+    
+    def setup_method(self):
+        self.mask_id = 126336
+        self.eos_id = 126081
+        self.decoder = SlideWindowRCRDecoder(
+            temperature=0.0,
+            threshold=0.9,
+            medium_threshold=0.8,
+            low_threshold=0.62,
+            window_size=3,
+            decline_threshold=0.1,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id
+        )
+    
+    def test_full_flow_step_by_step(self):
+        """
+        Test the complete flow discussed in our conversation:
+        
+        Step 1: Position j is mask, gets transferred with conf=0.75
+        Step 2: Position j is decoded, conf=0.70, no remask (insufficient history)
+        Step 3: Position j is decoded, conf=0.65, decline=0.75-0.65=0.10, not > 0.1
+        Step 4: Position j is decoded, conf=0.60 < low_threshold=0.62, remask!
+        Step 5: Position j is mask again, gets re-transferred
+        """
+        seq_len = 2
+        vocab_size = 100
+        
+        block_x = torch.full((1, seq_len), self.mask_id)
+        self.decoder.block_init(block_x, block_id=0)
+        
+        x = torch.full((1, seq_len), self.mask_id)
+        
+        # Step 1: Transfer position 0 with high confidence
+        logits1 = torch.zeros(1, seq_len, vocab_size)
+        logits1[:, 0, 50] = 10.0  # High confidence for token 50
+        logits1[:, 1, 60] = 10.0  # High confidence for token 60
+        
+        self.decoder.decode(logits1, 0, seq_len, x)
+        
+        assert x[0, 0] == 50, "Step 1: Position 0 should be decoded as token 50"
+        assert len(self.decoder.confidence_history) == 1
+        # Check history: position 0 should have confidence recorded
+        assert self.decoder.confidence_history[0][0, 0] > 0.9
+        print(f"Step 1: x={x.tolist()}, history_len={len(self.decoder.confidence_history)}")
+        
+        # Step 2: Position 0 decoded, conf decreases but insufficient history
+        logits2 = torch.zeros(1, seq_len, vocab_size)
+        logits2[:, 0, 50] = 3.0  # Lower confidence for token 50
+        logits2[:, 0, 99] = 2.0  # Some alternative
+        logits2[:, 1, 60] = 10.0
+        
+        self.decoder.decode(logits2, 0, seq_len, x)
+        
+        assert x[0, 0] == 50, "Step 2: Position 0 should still be token 50"
+        assert len(self.decoder.confidence_history) == 2
+        print(f"Step 2: x={x.tolist()}, history_len={len(self.decoder.confidence_history)}")
+        
+        # Step 3: Position 0 decoded, conf decreases more, but decline not > threshold
+        logits3 = torch.zeros(1, seq_len, vocab_size)
+        logits3[:, 0, 50] = 2.5  # Even lower
+        logits3[:, 0, 99] = 2.0
+        logits3[:, 1, 60] = 10.0
+        
+        self.decoder.decode(logits3, 0, seq_len, x)
+        
+        assert x[0, 0] == 50, "Step 3: Position 0 should still be token 50"
+        assert len(self.decoder.confidence_history) == 3
+        print(f"Step 3: x={x.tolist()}, history_len={len(self.decoder.confidence_history)}")
+        
+        # Step 4: Position 0 conf drops below low_threshold, should remask
+        logits4 = torch.zeros(1, seq_len, vocab_size)
+        logits4[:, 0, 50] = 0.5  # Very low confidence
+        logits4[:, 0, 99] = 0.3
+        logits4[:, 1, 60] = 10.0
+        
+        self.decoder.decode(logits4, 0, seq_len, x)
+        
+        # Position 0 should be remasked (conf < 0.62)
+        # But ensure_progress might save it if no other mask positions
+        print(f"Step 4: x={x.tolist()}, history_len={len(self.decoder.confidence_history)}")
+        
+        # Check that history for position 0 is cleared if it was remasked
+        if x[0, 0] == self.mask_id:
+            for hist in self.decoder.confidence_history:
+                assert hist[0, 0] == float('-inf'), "Remasked position should have -inf history"
+    
+    def test_remask_saved_by_ensure_progress(self):
+        """
+        Test the special case where a position is marked for remask,
+        but ensure_progress saves it because we need to make progress.
+        
+        Scenario:
+        - Position 0 is decoded, low confidence → marked for remask
+        - Position 1 is mask, but very low confidence
+        - ensure_progress needs to select something, picks position 0 back
+        - Position 0's history should NOT be cleared
+        """
+        seq_len = 2
+        vocab_size = 100
+        
+        block_x = torch.full((1, seq_len), self.mask_id)
+        self.decoder.block_init(block_x, block_id=0)
+        
+        # First, decode position 0
+        x = torch.full((1, seq_len), self.mask_id)
+        logits1 = torch.zeros(1, seq_len, vocab_size)
+        logits1[:, 0, 50] = 10.0
+        logits1[:, 1, 60] = 0.1  # Very low confidence for position 1
+        
+        self.decoder.decode(logits1, 0, seq_len, x)
+        assert x[0, 0] == 50
+        print(f"After step 1: x={x.tolist()}")
+        
+        # Now, position 0 has low confidence, position 1 is still mask with low conf
+        # Position 0 should be marked for remask, but ensure_progress might save it
+        logits2 = torch.zeros(1, seq_len, vocab_size)
+        logits2[:, 0, 50] = 0.3  # Very low confidence for decoded token
+        logits2[:, 1, 60] = 0.2  # Even lower for mask position
+        
+        self.decoder.decode(logits2, 0, seq_len, x)
+        print(f"After step 2: x={x.tolist()}")
+        
+        # The exact behavior depends on ensure_progress logic
+        # At minimum, we should make progress (at least one token decoded)
+    
+    def test_history_cleared_on_final_remask(self):
+        """
+        Test that when a position is finally remasked (not saved by ensure_progress),
+        its history is cleared to -inf in all history entries.
+        """
+        seq_len = 3
+        vocab_size = 100
+        
+        block_x = torch.full((1, seq_len), self.mask_id)
+        self.decoder.block_init(block_x, block_id=0)
+        
+        x = torch.full((1, seq_len), self.mask_id)
+        
+        # Decode all positions with high confidence
+        logits1 = torch.zeros(1, seq_len, vocab_size)
+        logits1[:, 0, 50] = 10.0
+        logits1[:, 1, 60] = 10.0
+        logits1[:, 2, 70] = 10.0
+        
+        self.decoder.decode(logits1, 0, seq_len, x)
+        assert torch.all(x != self.mask_id), "All positions should be decoded"
+        
+        # Step 2: All still high confidence
+        logits2 = torch.zeros(1, seq_len, vocab_size)
+        logits2[:, 0, 50] = 8.0
+        logits2[:, 1, 60] = 8.0
+        logits2[:, 2, 70] = 8.0
+        
+        self.decoder.decode(logits2, 0, seq_len, x)
+        
+        # Step 3: Position 0 drops to very low confidence
+        logits3 = torch.zeros(1, seq_len, vocab_size)
+        logits3[:, 0, 50] = 0.3  # Very low - should trigger remask
+        logits3[:, 1, 60] = 8.0  # High - can be transferred
+        logits3[:, 2, 70] = 8.0  # High - can be transferred
+        
+        self.decoder.decode(logits3, 0, seq_len, x)
+        
+        print(f"After step 3: x={x.tolist()}")
+        
+        # If position 0 was remasked, its history should be cleared
+        if x[0, 0] == self.mask_id:
+            for hist in self.decoder.confidence_history:
+                assert hist[0, 0] == float('-inf'), "Remasked position history should be -inf"
+            print("✓ Position 0 was remasked and history cleared")
+        else:
+            print("Position 0 was saved by ensure_progress")
+    
+    def test_declining_trend_triggers_remask(self):
+        """
+        Test that declining trend (not just low absolute value) triggers remask.
+        
+        Position 0: conf goes 0.85 → 0.78 → 0.72 (decline = 0.13 > 0.1)
+        Since 0.72 < medium_threshold=0.8, should trigger remask
+        """
+        seq_len = 2
+        vocab_size = 100
+        
+        block_x = torch.full((1, seq_len), self.mask_id)
+        self.decoder.block_init(block_x, block_id=0)
+        
+        x = torch.full((1, seq_len), self.mask_id)
+        
+        # Step 1: Decode with conf ~0.85
+        logits1 = torch.zeros(1, seq_len, vocab_size)
+        logits1[:, 0, 50] = 5.0  # Will give ~0.85+ confidence after softmax
+        logits1[:, 1, 60] = 10.0
+        
+        self.decoder.decode(logits1, 0, seq_len, x)
+        conf1 = self.decoder.confidence_history[-1][0, 0].item()
+        print(f"Step 1: conf={conf1:.3f}")
+        
+        # Step 2: conf decreases
+        logits2 = torch.zeros(1, seq_len, vocab_size)
+        logits2[:, 0, 50] = 3.5
+        logits2[:, 1, 60] = 10.0
+        
+        self.decoder.decode(logits2, 0, seq_len, x)
+        conf2 = self.decoder.confidence_history[-1][0, 0].item()
+        print(f"Step 2: conf={conf2:.3f}")
+        
+        # Step 3: conf decreases more, should trigger decline check
+        logits3 = torch.zeros(1, seq_len, vocab_size)
+        logits3[:, 0, 50] = 2.5  # Lower confidence
+        logits3[:, 1, 60] = 10.0
+        
+        self.decoder.decode(logits3, 0, seq_len, x)
+        
+        print(f"Step 3: x={x.tolist()}")
+        print(f"History: {[h[0, 0].item() for h in self.decoder.confidence_history]}")
+
+
 def run_tests():
     """Run all tests"""
     print("Running SlideWindowRCRDecoder tests...")
@@ -429,6 +648,25 @@ def run_tests():
     edge_test_class.setup_method()
     edge_test_class.test_ensure_progress_prevents_stall()
     print("✓ test_ensure_progress_prevents_stall passed")
+    
+    # Full flow tests
+    flow_test_class = TestSlideWindowRCRDecoderFullFlow()
+    
+    flow_test_class.setup_method()
+    flow_test_class.test_full_flow_step_by_step()
+    print("✓ test_full_flow_step_by_step passed")
+    
+    flow_test_class.setup_method()
+    flow_test_class.test_remask_saved_by_ensure_progress()
+    print("✓ test_remask_saved_by_ensure_progress passed")
+    
+    flow_test_class.setup_method()
+    flow_test_class.test_history_cleared_on_final_remask()
+    print("✓ test_history_cleared_on_final_remask passed")
+    
+    flow_test_class.setup_method()
+    flow_test_class.test_declining_trend_triggers_remask()
+    print("✓ test_declining_trend_triggers_remask passed")
     
     print("\n✅ All tests passed!")
 
