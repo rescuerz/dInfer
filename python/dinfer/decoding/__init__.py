@@ -1,4 +1,4 @@
-from .parallel_strategy import ThresholdParallelDecoder,CreditThresholdParallelDecoder, HierarchyDecoder
+from .parallel_strategy import ThresholdParallelDecoder,CreditThresholdParallelDecoder, HierarchyDecoder, SlideWindowRCRDecoder
 
 from .generate_uniform import BlockWiseDiffusionLLM, VicinityCacheDiffusionLLM, IterSmoothWithVicinityCacheDiffusionLLM, BlockWiseDiffusionLLMWithSP, IterSmoothDiffusionLLM, BlockDiffusionLLMAttnmask, BlockDiffusionLLM
 

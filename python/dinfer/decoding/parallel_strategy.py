@@ -496,3 +496,248 @@ class HierarchyDecoder(ParallelDecoder):
         self.iter += 1
         transfer_index = torch.logical_and(transfer_index, mask_index)
         x[:, block_start:block_end][transfer_index] = x0[transfer_index]
+
+
+class SlideWindowRCRDecoder(ParallelDecoder):
+    """ Slide Window Runtime-Confidence-Remask Decoder.
+    
+    This decoder tracks confidence history over a sliding window of decoding steps.
+    It remasks decoded tokens when:
+    1. Current confidence < low_threshold (absolute low)
+    2. Current confidence < medium_threshold AND confidence is declining over the window
+    
+    Parameters
+    ----------
+    temperature : float
+        Temperature for Gumbel noise sampling
+    threshold : float
+        High confidence threshold for transfer decision (default: 0.9)
+    medium_threshold : float
+        Medium confidence upper bound, used with decline detection (default: 0.8)
+    low_threshold : float
+        Low confidence threshold, directly remask (default: 0.62)
+    window_size : int
+        Size of sliding window for confidence history (default: 3)
+    decline_threshold : float
+        Threshold for confidence decline detection (default: 0.1)
+    mask_id : int
+        Token ID for mask
+    eos_id : int
+        Token ID for end of sequence
+    use_float64 : bool
+        Whether to use float64 for softmax computation
+    """
+    
+    def __init__(self, temperature, threshold=0.9, medium_threshold=0.8, 
+                 low_threshold=0.62, window_size=3, decline_threshold=0.1,
+                 mask_id=126336, eos_id=126081, use_float64=False):
+        super().__init__(temperature, 'low_confidence', mask_id)
+        self.threshold = threshold
+        self.medium_threshold = medium_threshold
+        self.low_threshold = low_threshold
+        self.window_size = window_size
+        self.decline_threshold = decline_threshold
+        self.eos_id = eos_id
+        self.use_float64 = use_float64
+        
+        # Confidence history: list of tensors, each shape [1, seq_len]
+        # -inf means the position is mask or not yet tracked
+        self.confidence_history = []
+        self.block_seq_len = None
+    
+    def block_init(self, block_x, block_id):
+        """ Initialize for a new block. Clear confidence history.
+        """
+        self.confidence_history = []
+        self.block_seq_len = block_x.shape[1]
+    
+    def _compute_confidence(self, logits, curr_x):
+        """ Compute confidence for all positions.
+        
+        For mask positions: use argmax token's probability
+        For decoded positions: use current token's probability
+        
+        Returns
+        -------
+        x0 : Tensor
+            Predicted tokens (argmax of logits with noise)
+        confidence : Tensor
+            Confidence scores for all positions
+        """
+        B, L, V = logits.shape
+        
+        # Add Gumbel noise for sampling
+        if not math.isclose(self.temperature, 0.0):
+            logits_with_noise = add_gumbel_noise(logits, temperature=self.temperature)
+        else:
+            logits_with_noise = logits
+        
+        x0 = torch.argmax(logits_with_noise, dim=-1)  # [B, L]
+        
+        # Compute softmax probabilities
+        if self.use_float64:
+            p = F.softmax(logits.to(torch.float64), dim=-1)
+        else:
+            p = F.softmax(logits.to(torch.float32), dim=-1)
+        
+        # For mask positions, use x0's probability
+        # For decoded positions, use current token's probability
+        mask_index = (curr_x == self.mask_id)
+        target_tokens = torch.where(mask_index, x0, curr_x)
+        confidence = torch.gather(p, dim=-1, index=target_tokens.unsqueeze(-1)).squeeze(-1)
+        
+        return x0, confidence
+    
+    def _is_declining(self, pos_idx):
+        """ Check if confidence at position pos_idx is declining over the window.
+        
+        Returns True if:
+        - Window is full (len >= window_size)
+        - First element is not -inf
+        - decline = history[0] - history[-1] > decline_threshold
+        """
+        if len(self.confidence_history) < self.window_size:
+            return False
+        
+        # Get history for this position from the last window_size steps
+        history = [self.confidence_history[-(self.window_size - i)][0, pos_idx].item() 
+                   for i in range(self.window_size)]
+        
+        # If first is -inf, cannot compute valid decline
+        if history[0] == float('-inf'):
+            return False
+        
+        decline = history[0] - history[-1]
+        return decline > self.decline_threshold
+    
+    def _compute_remask_index(self, confidence, mask_index):
+        """ Compute which decoded positions should be remasked.
+        
+        Remask conditions (only for decoded positions):
+        1. confidence < low_threshold (absolute low)
+        2. confidence < medium_threshold AND _is_declining (trend-based)
+        """
+        B, L = confidence.shape
+        remask_index = torch.zeros_like(mask_index, dtype=torch.bool)
+        
+        for j in range(L):
+            # Only consider decoded positions (not mask)
+            if mask_index[0, j]:
+                continue
+            
+            curr_conf = confidence[0, j].item()
+            
+            # Condition 1: absolute low confidence
+            if curr_conf < self.low_threshold:
+                remask_index[0, j] = True
+                continue
+            
+            # Condition 2: medium confidence + declining trend
+            if curr_conf < self.medium_threshold:
+                if self._is_declining(j):
+                    remask_index[0, j] = True
+        
+        return remask_index
+    
+    def _ensure_progress(self, transfer_index, confidence, remask_cnt):
+        """ Ensure at least one token is decoded per step.
+        
+        If remask_cnt + 1 > transfer_cnt, select additional tokens by confidence.
+        """
+        gap = int((remask_cnt + 1 - transfer_index.sum()).item())
+        if gap > 0:
+            # Set already selected positions to -inf
+            conf_for_select = confidence.clone()
+            conf_for_select[transfer_index] = float('-inf')
+            
+            # Select top-gap positions by confidence
+            _, indices = torch.topk(conf_for_select.view(-1), gap, largest=True, sorted=False)
+            transfer_index.view(-1)[indices] = True
+    
+    def _update_history(self, confidence, prev_x, transfer_index, final_remask):
+        """ Update confidence history after all decisions are made.
+        
+        Rules:
+        - final_remask positions: set to -inf (clear history)
+        - decoded positions (including newly transferred): record confidence
+        - mask positions: set to -inf
+        """
+        B, L = confidence.shape
+        new_history = torch.full_like(confidence, float('-inf'))
+        
+        # Positions that were mask before this step
+        was_mask = (prev_x == self.mask_id)
+        
+        # Positions that are decoded after this step (either already decoded or newly transferred)
+        # and not final_remask
+        is_decoded = torch.logical_or(
+            torch.logical_not(was_mask),  # was already decoded
+            transfer_index  # newly transferred
+        )
+        is_decoded_and_not_remask = torch.logical_and(is_decoded, torch.logical_not(final_remask))
+        
+        # Record confidence for decoded positions
+        new_history[is_decoded_and_not_remask] = confidence[is_decoded_and_not_remask]
+        
+        # Append to history, maintain window size
+        self.confidence_history.append(new_history.clone())
+        if len(self.confidence_history) > self.window_size:
+            self.confidence_history.pop(0)
+        
+        # Clear history for final_remask positions in all history entries
+        if final_remask.any():
+            for hist in self.confidence_history:
+                hist[final_remask] = float('-inf')
+    
+    def decode(self, logits, block_start, block_end, x, iter_threshold=None):
+        """ Decode the logits in a block with slide window remask.
+        """
+        if iter_threshold is None:
+            iter_threshold = self.threshold
+        
+        B, L = logits.shape[0], logits.shape[1]
+        assert B == 1, "SlideWindowRCRDecoder only supports batch_size=1"
+        
+        curr_x = x[:, block_start:block_end]
+        mask_index = (curr_x == self.mask_id)
+        assert mask_index.shape[1] == logits.shape[1]
+        
+        # 1. Compute confidence for all positions
+        x0, confidence = self._compute_confidence(logits, curr_x)
+        
+        # 2. Compute remask index (only for decoded positions)
+        remask_index = self._compute_remask_index(confidence, mask_index)
+        
+        # 3. Compute new mask region (original mask + remask)
+        mask_new = torch.logical_or(mask_index, remask_index)
+        
+        # 4. Compute transfer_index using threshold strategy
+        # Similar to get_transfer_index_threshold but on mask_new
+        confidence_for_transfer = torch.where(mask_new, confidence, torch.tensor(float('-inf'), device=confidence.device))
+        
+        # Ensure denoised token is not mask_id
+        mask_new_and_valid = mask_new & (x0 != self.mask_id)
+        x0_safe = torch.where(mask_new_and_valid, x0, curr_x)
+        confidence_for_transfer = torch.where(mask_new_and_valid, confidence, torch.tensor(float('-inf'), device=confidence.device))
+        
+        # Apply threshold: transfer if confidence >= threshold
+        # But at least transfer the highest confidence token
+        actual_threshold = (torch.max(confidence_for_transfer, dim=1)[0] - 1e-5).clamp(-1000, iter_threshold).unsqueeze(-1)
+        transfer_index = confidence_for_transfer >= actual_threshold
+        
+        # 5. Ensure progress: at least decode one token per step
+        remask_cnt = remask_index.sum()
+        self._ensure_progress(transfer_index, confidence_for_transfer, remask_cnt)
+        
+        # 6. Compute final remask (remask but not transferred)
+        final_remask = torch.logical_and(remask_index, torch.logical_not(transfer_index))
+        
+        # 7. Update x0 for final_remask positions
+        x0[final_remask] = self.mask_id
+        
+        # 8. Apply transfer: only transfer within mask_new region
+        transfer_index = torch.logical_and(transfer_index, mask_new)
+        x[:, block_start:block_end] = torch.where(transfer_index, x0, curr_x)
+        
+        # 9. Update confidence history (after all decisions)
+        self._update_history(confidence, curr_x, transfer_index, final_remask)
