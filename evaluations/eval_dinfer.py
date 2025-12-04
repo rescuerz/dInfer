@@ -40,7 +40,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 @dataclass
 class EvalConfig:
     model_name: str = '/mnt/dllm/fengling/moe/workdir/7bA1b_anneal_19t_500B_further_8k_anneal_train_4k_ep3_v8p5/step45567_converted_hf_fusemoe'
-    gpu: str = '0,1,2,3'
+    gpu: str = '0-1-2-3'
     batch_size: int = 1
     gen_len: int = 1024
     prefix_look: int = 0
@@ -64,6 +64,10 @@ class EvalConfig:
     use_compile: bool = True
     use_bd: bool = False
     use_shift: bool = False
+    # 历史专家路由配置
+    use_history_routing: bool = False
+    history_gamma: float = 0.5
+    history_decay: float = 0.9
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -101,15 +105,23 @@ class DInferEvalHarness(LM):
         use_compile = True,
         master_port = '23456',
         use_cudagraph = True,
-        gpus = '0,1,2,3',
+        gpus = '0-1-2-3',
         use_bd = False,
         prefix_look = 0,
         after_look = 0,
         use_shift = True,
+        use_history_routing = False,
+        history_gamma = 0.5,
+        history_decay = 0.9,
         **kwargs
     ):
 
         super().__init__()
+        
+        # 历史专家路由配置
+        self.use_history_routing = use_history_routing
+        self.history_gamma = history_gamma
+        self.history_decay = history_decay
         
         self.model_path = model_path
         self.mask_id = mask_id
@@ -143,7 +155,9 @@ class DInferEvalHarness(LM):
         self.kwargs = kwargs
         self.use_shift = use_shift
 
-        if "moe" or "mini" in model_path:
+        # 将 model_path 转为小写进行判断
+        model_path_lower = model_path.lower()
+        if "moe" in model_path_lower or "mini" in model_path_lower:
             self.mask_id = 156895
             self.eos_id = 156892
             self.is_moe = True
@@ -173,7 +187,7 @@ class DInferEvalHarness(LM):
                                       mask_id=self.mask_id, eos_id=self.eos_id)
         if parallel == 'dp':
             self.device= torch.device(device)
-            if "moe" or "mini" in model_path:
+            if "moe" in model_path_lower or "mini" in model_path_lower:
                 # initialize tensor parallel but don't use it
                 os.environ['MASTER_ADDR'] = 'localhost'
                 os.environ['MASTER_PORT'] = '1234'+str(self.rank)
@@ -185,12 +199,13 @@ class DInferEvalHarness(LM):
                     print("EP Enabled:", vllm_config.parallel_config.enable_expert_parallel)
                     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
                     # load model
-                    if 'moe' in model_path:
+                    if 'moe' in model_path_lower:
                         model = LLaDAMoeModelLM(config=config).eval()
                         model.load_weights(self.model_path, torch_dtype=torch.bfloat16)
                     else:
                         model = LLaDA2MoeModelLM(config=config).eval()
                         model.load_weights(self.model_path, torch_dtype=torch.bfloat16)
+                    self.model = model  # 赋值给 self.model
                     self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
                     self.vllm_config = vllm_config
             else:
@@ -204,6 +219,11 @@ class DInferEvalHarness(LM):
                 self.device = torch.device(f'{self.accelerator.device}')
             else:
                 self.model = self.model.to(self.device)
+
+            # 配置历史专家路由
+            if self.use_history_routing and hasattr(self.model, 'set_history_routing'):
+                self.model.set_history_routing(enabled=True, gamma=self.history_gamma, decay=self.history_decay)
+                print(f"历史专家路由已启用: gamma={self.history_gamma}, decay={self.history_decay}")
 
             if self.use_compile:
                 # compile model
@@ -468,10 +488,11 @@ class DInferEvalHarness(LM):
                 print("EP Enabled:", vllm_config.parallel_config.enable_expert_parallel)
 
                 model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
-                if 'moe' in args.model_name:
+                model_name_lower = args.model_name.lower()
+                if 'moe' in model_name_lower:
                     model = LLaDAMoeModelLM(config=model_config).eval()
                     model.load_weights(args.model_name, torch_dtype=torch.bfloat16)
-                elif 'mini' in args.model_name:
+                elif 'mini' in model_name_lower:
                     model = LLaDA2MoeModelLM(config=model_config).eval()
                     model.load_weights(args.model_name, torch_dtype=torch.bfloat16)
                 else:
@@ -485,6 +506,12 @@ class DInferEvalHarness(LM):
                 model = model.to(device)
                 out = model(x, use_cache=False)
                 out = model(x, use_cache=True)
+
+                # 配置历史专家路由
+                if hasattr(args, 'use_history_routing') and args.use_history_routing and hasattr(model, 'set_history_routing'):
+                    model.set_history_routing(enabled=True, gamma=args.history_gamma, decay=args.history_decay)
+                    if rank == 0:
+                        print(f"历史专家路由已启用: gamma={args.history_gamma}, decay={args.history_decay}")
 
                 if args.use_compile:
                     if args.use_cudagraph:
@@ -676,7 +703,7 @@ class DInferEvalHarness(LM):
         elif self.parallel == 'tp':
             procs = []
             answers = []
-            gpus = [int(gpu) for gpu in self.gpus.split(',')]
+            gpus = [int(gpu) for gpu in self.gpus.split('-')]
             args = {"gpu": self.gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift}
             args = EvalConfig(**args)
             args.tp_size = len(gpus)
@@ -704,7 +731,76 @@ class DInferEvalHarness(LM):
         return answers
 
 
-if __name__ == "__main__":
-    set_seed(1234)
-    cli_evaluate()
+class TeeOutput:
+    """同时输出到终端和文件的类"""
+    def __init__(self, file_path, mode='a'):
+        self.terminal = sys.stdout
+        self.file_path = file_path
+        self.mode = mode
+        self.file = None
     
+    def open(self):
+        os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+        self.file = open(self.file_path, self.mode, encoding='utf-8')
+        # 写入分隔符和时间戳
+        self.file.write('\n' + '='*80 + '\n')
+        self.file.write(f'Timestamp: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+        self.file.write('='*80 + '\n\n')
+        self.file.write(f'Command: {" ".join(sys.argv)}\n\n')
+        self.file.flush()
+    
+    def write(self, message):
+        self.terminal.write(message)
+        if self.file is not None:
+            self.file.write(message)
+            self.file.flush()  # 实时刷新，确保不丢失输出
+    
+    def flush(self):
+        self.terminal.flush()
+        if self.file is not None:
+            self.file.flush()
+    
+    def close(self):
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+
+
+if __name__ == "__main__":
+    import sys
+    set_seed(1234)
+    
+    # 从命令行参数中提取 save_dir
+    save_dir = None
+    if '--output_path' in sys.argv:
+        output_path_idx = sys.argv.index('--output_path')
+        if output_path_idx + 1 < len(sys.argv):
+            save_dir = sys.argv[output_path_idx + 1]
+    
+    # 如果没有找到 --output_path，尝试从 --model_args 中的 save_dir 提取
+    if save_dir is None and '--model_args' in sys.argv:
+        model_args_idx = sys.argv.index('--model_args')
+        if model_args_idx + 1 < len(sys.argv):
+            model_args = sys.argv[model_args_idx + 1]
+            if 'save_dir=' in model_args:
+                save_dir = model_args.split('save_dir=')[1].split(',')[0]
+    
+    # 设置 Tee 输出（同时输出到终端和文件）
+    tee = None
+    if save_dir is not None:
+        log_file = os.path.join(save_dir, 'log.txt')
+        tee = TeeOutput(log_file, mode='a')
+        tee.open()
+        sys.stdout = tee
+        # 同时重定向 stderr 以捕获警告和错误
+        sys.stderr = tee
+    
+    try:
+        cli_evaluate()
+    finally:
+        if tee is not None:
+            # 恢复标准输出
+            sys.stdout = tee.terminal
+            sys.stderr = tee.terminal
+            tee.close()
+            print(f'\nAll output saved to: {log_file}')

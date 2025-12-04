@@ -478,6 +478,13 @@ class BlockWiseDiffusionLLM(DiffusionLLM):
 
         # We need to reset iter_no at the beginning of generating a sequence.
         self.diff_iteration.iter_no = 0
+        
+        # 重置 MoE 历史路由信息 (用于历史专家复用功能)
+        if hasattr(self.model, 'reset_moe_history'):
+            # print("[Generate] Resetting MoE history routing...")
+            self.model.reset_moe_history()
+            # print("[Generate] MoE history routing reset complete")
+        
         kv_cache = self.cache_factory.create() if self.cache_factory is not None else None
         for block_id, (block_loc, block) in enumerate(it):
             self.decoder.block_init(block, block_id)

@@ -1,0 +1,4 @@
+[submodule "vllm"]
+	path = vllm
+	url = https://github.com/rescuerz/vllm.git
+	branch = releases/v0.10.2_consistent_moe

@@ -659,6 +659,9 @@ class OlmoeMoE(nn.Module):
     Each expert's weights are sharded across all ranks and a fused MoE
     kernel is used for the forward pass, and finally we reduce the outputs
     across ranks.
+    
+    支持历史专家路由复用 (History-aware Expert Routing):
+    在 dLLM 迭代去噪过程中，将历史专家选择信息作为先验注入到当前路由决策中。
     """
 
     def __init__(self,
@@ -692,19 +695,99 @@ class OlmoeMoE(nn.Module):
         expert_map = self.experts.expert_map
         del self.experts.expert_map
         self.experts.register_buffer('expert_map', expert_map)
+        
+        # 历史专家路由配置
+        self.use_history_routing = getattr(config, 'use_history_routing', False)
+        self.base_gamma = getattr(config, 'history_routing_gamma', 0.5)
+        self.gamma_decay = getattr(config, 'history_routing_decay', 0.9)
+        
+        # 历史路由缓存
+        self.prev_expert_ids = None      # [num_tokens, top_k]
+        self.prev_expert_weights = None  # [num_tokens, top_k]
+        self.current_iter_no = 0         # 由外部 (FusedOlmoeForCausalLM) 设置的全局迭代计数器
+    
+    def reset_history(self):
+        """重置历史路由信息，每次 generate 开始时调用"""
+        self.prev_expert_ids = None
+        self.prev_expert_weights = None
+        # current_iter_no 由外部控制，不在这里重置
+    
+    def _get_current_gamma(self) -> float:
+        """动态计算 gamma，随迭代次数衰减"""
+        return self.base_gamma * (self.gamma_decay ** self.current_iter_no)
+    
+    def _inject_history_prior(self, router_logits: torch.Tensor) -> torch.Tensor:
+        """
+        将历史专家信息作为先验注入到 router_logits
+        
+        使用对数注入方式: adjusted_logits = logits + gamma * log(prior)
+        相当于在概率空间做乘法: P_new ∝ P_curr * P_prev^gamma
+        """
+        if self.prev_expert_ids is None:
+            print(f"[MoE History] iter={self.current_iter_no}: No history, using original logits")
+            return router_logits
+        
+        # 检查形状是否匹配
+        num_tokens = router_logits.shape[0]
+        if self.prev_expert_ids.shape[0] != num_tokens:
+            # 形状不匹配，跳过历史注入
+            print(f"[MoE History] iter={self.current_iter_no}: Shape mismatch ({self.prev_expert_ids.shape[0]} vs {num_tokens}), skipping")
+            return router_logits
+        
+        gamma = self._get_current_gamma()
+        
+        # 构建历史先验 [num_tokens, num_experts]
+        history_prior = torch.zeros_like(router_logits)
+        history_prior.scatter_(1, self.prev_expert_ids, self.prev_expert_weights)
+        
+        # 对数注入 (在 softmax 之前)
+        adjusted_logits = router_logits + gamma * torch.log(history_prior + 1e-8)
+        
+        print(f"[MoE History] iter={self.current_iter_no}: Injected history prior with gamma={gamma:.4f}")
+        
+        return adjusted_logits
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
+        
+        # 确保 batch_size = 1 (历史路由仅支持单样本)
+        # assert orig_shape[0] == 1, "History routing only supports batch_size=1"
+        
         # router_logits: (num_tokens, n_experts)
         original_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         router_logits, _ = self.gate(hidden_states)
+        
+        # 注入历史先验
+        if self.use_history_routing:
+            router_logits = self._inject_history_prior(router_logits)
+        
         hidden_states = hidden_states.to(original_dtype)
-        final_hidden_states = self.experts.forward_impl(hidden_states=hidden_states,
-                                           router_logits=router_logits)
+        
+        # 专家计算 (返回路由信息用于保存历史)
+        if self.use_history_routing:
+            result = self.experts.forward_impl(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                return_router_info=True
+            )
+            final_hidden_states, topk_ids, topk_weights = result
+            
+            # 保存本次路由结果 (iter_no 由外部 FusedOlmoeForCausalLM 控制)
+            self.prev_expert_ids = topk_ids.detach()
+            self.prev_expert_weights = topk_weights.detach()
+            
+            # 打印调试信息
+            print(f"[MoE History] Saved routing info: topk_ids shape={topk_ids.shape}, iter_no={self.current_iter_no}")
+        else:
+            final_hidden_states = self.experts.forward_impl(
+                hidden_states=hidden_states,
+                router_logits=router_logits
+            )
+        
         return final_hidden_states.view(orig_shape)
 
 
@@ -1098,6 +1181,10 @@ class FusedOlmoeForCausalLM(OlmoePreTrainedModel):
         self.num_experts_per_tok = config.num_experts_per_tok
         # Initialize weights and apply final processing
         self._tp_size = 1
+        
+        # 全局去噪步骤计数器 (所有 MoE 层共享)
+        self.global_iter_no = 0
+        
         self.post_init()
         self._tp_plan = {
             "layers.*.self_attn.q_proj": "colwise",
@@ -1196,6 +1283,31 @@ class FusedOlmoeForCausalLM(OlmoePreTrainedModel):
     def init_h2e_module(self):
         self.h2e = H2Embed(self.model.embed_tokens, tau=1.0)
 
+    def reset_moe_history(self):
+        """
+        重置所有 MoE 层的历史路由信息
+        应在每次 generate 调用开始时调用
+        """
+        self.global_iter_no = 0  # 重置全局计数器
+        for layer in self.model.layers:
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'reset_history'):
+                layer.mlp.reset_history()
+    
+    def set_history_routing(self, enabled: bool = True, gamma: float = 0.5, decay: float = 0.9):
+        """
+        配置历史路由功能
+        
+        Args:
+            enabled: 是否启用历史路由
+            gamma: 历史先验强度基础值
+            decay: gamma 随迭代次数的衰减系数
+        """
+        for layer in self.model.layers:
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'use_history_routing'):
+                layer.mlp.use_history_routing = enabled
+                layer.mlp.base_gamma = gamma
+                layer.mlp.gamma_decay = decay
+
     @add_start_docstrings_to_model_forward(OLMOE_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=MoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -1255,6 +1367,11 @@ class FusedOlmoeForCausalLM(OlmoePreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # 将全局计数器传递给所有 MoE 层
+        for layer in self.model.layers:
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'use_history_routing'):
+                layer.mlp.current_iter_no = self.global_iter_no
+        
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -1270,6 +1387,9 @@ class FusedOlmoeForCausalLM(OlmoePreTrainedModel):
             cache_position=cache_position,
             replace_position=replace_position,
         )
+        
+        # forward 完成后递增全局计数器
+        self.global_iter_no += 1
 
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
