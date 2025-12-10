@@ -37,6 +37,14 @@ datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True
 datasets.config.DOWNLOAD_TIMEOUT = 180 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
+def str_to_bool(value):
+    """Convert string to boolean. Handles 'True', 'False', 'true', 'false', etc."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ('true', '1', 'yes')
+    return bool(value)
+
 @dataclass
 class EvalConfig:
     model_name: str = '/mnt/dllm/fengling/moe/workdir/7bA1b_anneal_19t_500B_further_8k_anneal_train_4k_ep3_v8p5/step45567_converted_hf_fusemoe'
@@ -68,6 +76,9 @@ class EvalConfig:
     medium_threshold: float = 0.8
     window_size: int = 3
     decline_threshold: float = 0.1
+    enable_low_threshold: bool = False
+    enable_decline_threshold: bool = False
+    enable_consecutive_decline: bool = False
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -114,6 +125,9 @@ class DInferEvalHarness(LM):
         medium_threshold: float = 0.8,
         window_size: int = 3,
         decline_threshold: float = 0.1,
+        enable_low_threshold: bool = False,
+        enable_decline_threshold: bool = False,
+        enable_consecutive_decline: bool = False,
         **kwargs
     ):
 
@@ -154,6 +168,10 @@ class DInferEvalHarness(LM):
         self.medium_threshold = medium_threshold
         self.window_size = window_size
         self.decline_threshold = decline_threshold
+        # Convert string to bool for enable flags (lm_eval passes strings from model_args)
+        self.enable_low_threshold = str_to_bool(enable_low_threshold)
+        self.enable_decline_threshold = str_to_bool(enable_decline_threshold)
+        self.enable_consecutive_decline = str_to_bool(enable_consecutive_decline)
 
         model_path_lower = model_path.lower()
         if "moe" in model_path_lower or "mini" in model_path_lower:
@@ -191,7 +209,10 @@ class DInferEvalHarness(LM):
                 decline_threshold=decline_threshold,
                 mask_id=self.mask_id,
                 eos_id=self.eos_id,
-                debug=False
+                debug=False,
+                enable_low_threshold=self.enable_low_threshold,
+                enable_decline_threshold=self.enable_decline_threshold,
+                enable_consecutive_decline=self.enable_consecutive_decline
             )
         else:
             decoder = HierarchyDecoder(temperature=0, threshold=threshold, low_threshold=low_threshold,
@@ -537,7 +558,10 @@ class DInferEvalHarness(LM):
                         decline_threshold=args.decline_threshold,
                         mask_id=self.mask_id,
                         eos_id=self.eos_id,
-                        debug=False
+                        debug=False,
+                        enable_low_threshold=args.enable_low_threshold,
+                        enable_decline_threshold=args.enable_decline_threshold,
+                        enable_consecutive_decline=args.enable_consecutive_decline
                     )
                 else:
                     decoder = HierarchyDecoder(temperature=0, threshold=args.threshold, low_threshold=args.low_threshold, mask_id=self.mask_id, eos_id=self.eos_id)
@@ -792,7 +816,7 @@ class DInferEvalHarness(LM):
             # Support both comma and hyphen as separator (hyphen avoids lm_eval parsing issues)
             gpus_str = self.gpus.replace('-', ',')
             gpus = [int(gpu) for gpu in gpus_str.split(',')]
-            args = {"gpu": self.gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "medium_threshold": self.medium_threshold, "window_size": self.window_size, "decline_threshold": self.decline_threshold}
+            args = {"gpu": self.gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "medium_threshold": self.medium_threshold, "window_size": self.window_size, "decline_threshold": self.decline_threshold, "enable_low_threshold": self.enable_low_threshold, "enable_decline_threshold": self.enable_decline_threshold, "enable_consecutive_decline": self.enable_consecutive_decline}
             args = EvalConfig(**args)
             args.tp_size = len(gpus)
             args.use_tp = args.tp_size > 1

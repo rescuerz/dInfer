@@ -2,6 +2,17 @@
 Inference script for SlideWindowRCRDecoder
 
 This script demonstrates how to use the SlideWindowRCRDecoder with BlockWiseDiffusionLLM.
+# 默认不启用任何重掩码策略（行为与 ThresholdParallelDecoder 相同）
+python inference_slide_window_rcr.py
+
+# 只启用低阈值策略
+python inference_slide_window_rcr.py --enable_low_threshold
+
+# 启用下降幅度和连续下降策略（不启用低阈值）
+python inference_slide_window_rcr.py --enable_decline_threshold --enable_consecutive_decline
+
+# 启用全部三种策略
+python inference_slide_window_rcr.py --enable_low_threshold --enable_decline_threshold --enable_consecutive_decline
 """
 import os
 import torch
@@ -35,6 +46,12 @@ def parse_args():
                         help='Sliding window size for confidence history')
     parser.add_argument('--decline_threshold', type=float, default=0.1,
                         help='Threshold for confidence decline detection')
+    parser.add_argument('--enable_low_threshold', action='store_true',
+                        help='Enable low threshold remask strategy (conf < low_threshold)')
+    parser.add_argument('--enable_decline_threshold', action='store_true',
+                        help='Enable decline threshold remask strategy (decline > decline_threshold)')
+    parser.add_argument('--enable_consecutive_decline', action='store_true',
+                        help='Enable consecutive decline remask strategy (every step decreasing)')
     parser.add_argument('--gen_length', type=int, default=256,
                         help='Maximum generation length')
     parser.add_argument('--block_length', type=int, default=64,
@@ -90,6 +107,9 @@ def main():
         print(f"  low_threshold={args.low_threshold}")
         print(f"  window_size={args.window_size}")
         print(f"  decline_threshold={args.decline_threshold}")
+        print(f"  enable_low_threshold={args.enable_low_threshold}")
+        print(f"  enable_decline_threshold={args.enable_decline_threshold}")
+        print(f"  enable_consecutive_decline={args.enable_consecutive_decline}")
         decoder = SlideWindowRCRDecoder(
             temperature=args.temperature,
             threshold=args.threshold,
@@ -100,7 +120,10 @@ def main():
             mask_id=mask_id,
             eos_id=eos_id,
             debug=True,  # Enable debug mode
-            tokenizer=tokenizer  # Pass tokenizer for debug output
+            tokenizer=tokenizer,  # Pass tokenizer for debug output
+            enable_low_threshold=args.enable_low_threshold,
+            enable_decline_threshold=args.enable_decline_threshold,
+            enable_consecutive_decline=args.enable_consecutive_decline
         )
 
     print("========== Step 5: Create Diffusion LLM ==========")

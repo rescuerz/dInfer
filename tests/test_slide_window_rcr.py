@@ -6,7 +6,7 @@ without requiring an actual model.
 """
 import torch
 import pytest
-from dinfer.decoding.parallel_strategy import SlideWindowRCRDecoder
+from dinfer.decoding.parallel_strategy import SlideWindowRCRDecoder, ThresholdParallelDecoder
 
 
 class TestSlideWindowRCRDecoder:
@@ -25,7 +25,10 @@ class TestSlideWindowRCRDecoder:
             decline_threshold=0.1,
             mask_id=self.mask_id,
             eos_id=self.eos_id,
-            use_float64=False
+            use_float64=False,
+            enable_low_threshold=True,
+            enable_decline_threshold=True,
+            enable_consecutive_decline=True
         )
     
     def test_init(self):
@@ -38,6 +41,9 @@ class TestSlideWindowRCRDecoder:
         assert self.decoder.mask_id == self.mask_id
         assert self.decoder.eos_id == self.eos_id
         assert len(self.decoder.confidence_history) == 0
+        assert self.decoder.enable_low_threshold == True
+        assert self.decoder.enable_decline_threshold == True
+        assert self.decoder.enable_consecutive_decline == True
     
     def test_block_init(self):
         """Test block initialization clears history"""
@@ -90,46 +96,64 @@ class TestSlideWindowRCRDecoder:
         assert x0[0, 1] == 40
     
     def test_is_declining_insufficient_history(self):
-        """Test _is_declining returns False when history is insufficient"""
+        """Test _is_declining returns (False, None) when history is insufficient"""
         # Empty history (need window_size - 1 = 2 historical steps)
-        assert self.decoder._is_declining(0, 0.7) == False
+        assert self.decoder._is_declining(0, 0.7) == (False, None)
         
         # Only 1 historical step, need 2
         self.decoder.confidence_history = [
             torch.tensor([[0.8, 0.7]])
         ]
-        assert self.decoder._is_declining(0, 0.7) == False
+        assert self.decoder._is_declining(0, 0.7) == (False, None)
     
     def test_is_declining_with_inf(self):
-        """Test _is_declining returns False when first element is -inf"""
+        """Test _is_declining returns (False, None) when first element is -inf"""
         # With window_size=3, we need 2 historical steps + current
         self.decoder.confidence_history = [
             torch.tensor([[float('-inf'), 0.8]]),
             torch.tensor([[0.75, 0.75]])
         ]
         # Position 0 has -inf at start of window
-        assert self.decoder._is_declining(0, 0.70) == False
+        assert self.decoder._is_declining(0, 0.70) == (False, None)
         # Position 1: history=[0.8, 0.75] + curr=0.65 → decline=0.8-0.65=0.15 > 0.1
-        assert self.decoder._is_declining(1, 0.65) == True
+        is_declining, decline_type = self.decoder._is_declining(1, 0.65)
+        assert is_declining == True
+        assert decline_type == 'threshold'
     
     def test_is_declining_true(self):
-        """Test _is_declining returns True for declining confidence"""
+        """Test _is_declining returns (True, type) for declining confidence"""
         # With window_size=3, we need 2 historical steps + current
         self.decoder.confidence_history = [
             torch.tensor([[0.85, 0.9]]),
             torch.tensor([[0.75, 0.85]])
         ]
         # Position 0: history=[0.85, 0.75] + curr=0.65 → decline=0.85-0.65=0.2 > 0.1
-        assert self.decoder._is_declining(0, 0.65) == True
+        is_declining, decline_type = self.decoder._is_declining(0, 0.65)
+        assert is_declining == True
+        assert decline_type in ['threshold', 'consecutive']
         # Position 1: history=[0.9, 0.85] + curr=0.80 → decline=0.9-0.80=0.1, not > 0.1
-        assert self.decoder._is_declining(1, 0.80) == False
+        # But consecutive declining: 0.9 > 0.85 > 0.80, so it triggers 'consecutive'
+        is_declining_1, decline_type_1 = self.decoder._is_declining(1, 0.80)
+        assert is_declining_1 == True
+        assert decline_type_1 == 'consecutive'
+        
+        # Test case where neither threshold nor consecutive triggers
+        # Position 1: history=[0.9, 0.85] + curr=0.86 → not consecutive (0.85 < 0.86)
+        is_declining_2, decline_type_2 = self.decoder._is_declining(1, 0.86)
+        assert is_declining_2 == False
+        assert decline_type_2 == None
     
     def test_compute_remask_index_low_confidence(self):
         """Test remask for low confidence positions"""
+        # Initialize block first to set prompt_positions
+        block_x = torch.full((1, 3), self.mask_id)
+        self.decoder.block_init(block_x, block_id=0)
+        
         confidence = torch.tensor([[0.5, 0.7, 0.9]])  # Position 0 is low
         mask_index = torch.tensor([[False, False, True]])  # Position 2 is mask
         
-        remask_index = self.decoder._compute_remask_index(confidence, mask_index)
+        remask_index, low_conf_indices, declining_indices, consecutive_indices = \
+            self.decoder._compute_remask_index(confidence, mask_index)
         
         # Position 0: decoded, conf=0.5 < low_threshold=0.62 → remask
         # Position 1: decoded, conf=0.7 > low_threshold → no remask (unless declining)
@@ -137,9 +161,14 @@ class TestSlideWindowRCRDecoder:
         assert remask_index[0, 0] == True
         assert remask_index[0, 1] == False
         assert remask_index[0, 2] == False
+        assert 0 in low_conf_indices
     
     def test_compute_remask_index_declining(self):
         """Test remask for declining confidence positions"""
+        # Initialize block first to set prompt_positions
+        block_x = torch.full((1, 2), self.mask_id)
+        self.decoder.block_init(block_x, block_id=0)
+        
         # With window_size=3, we need 2 historical steps + current
         # Setup history showing decline
         self.decoder.confidence_history = [
@@ -150,7 +179,8 @@ class TestSlideWindowRCRDecoder:
         confidence = torch.tensor([[0.79, 0.65]])  # Current step
         mask_index = torch.tensor([[False, False]])  # Both decoded
         
-        remask_index = self.decoder._compute_remask_index(confidence, mask_index)
+        remask_index, low_conf_indices, declining_indices, consecutive_indices = \
+            self.decoder._compute_remask_index(confidence, mask_index)
         
         # Position 0: conf=0.79 < medium=0.8, check decline: 0.90-0.79=0.11 > 0.1 → remask
         # Position 1: conf=0.65 > low=0.62, check decline: 0.85-0.65=0.2 > 0.1 → remask
@@ -291,7 +321,10 @@ class TestSlideWindowRCRDecoderEdgeCases:
             window_size=3,
             decline_threshold=0.1,
             mask_id=self.mask_id,
-            eos_id=self.eos_id
+            eos_id=self.eos_id,
+            enable_low_threshold=True,
+            enable_decline_threshold=True,
+            enable_consecutive_decline=True
         )
     
     def test_all_positions_decoded(self):
@@ -365,7 +398,10 @@ class TestSlideWindowRCRDecoderFullFlow:
             window_size=3,
             decline_threshold=0.1,
             mask_id=self.mask_id,
-            eos_id=self.eos_id
+            eos_id=self.eos_id,
+            enable_low_threshold=True,
+            enable_decline_threshold=True,
+            enable_consecutive_decline=True
         )
     
     def test_full_flow_step_by_step(self):
@@ -571,6 +607,484 @@ class TestSlideWindowRCRDecoderFullFlow:
         print(f"History: {[h[0, 0].item() for h in self.decoder.confidence_history]}")
 
 
+class TestSlideWindowRCRDecoderEnableFlags:
+    """Test enable flags for remask strategies"""
+    
+    def setup_method(self):
+        self.mask_id = 126336
+        self.eos_id = 126081
+        self.vocab_size = 100
+    
+    def test_default_all_disabled(self):
+        """Test that all strategies are disabled by default"""
+        decoder = SlideWindowRCRDecoder(
+            temperature=0.0,
+            threshold=0.9,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id
+        )
+        assert decoder.enable_low_threshold == False
+        assert decoder.enable_decline_threshold == False
+        assert decoder.enable_consecutive_decline == False
+    
+    def test_enable_low_threshold_only(self):
+        """Test that only low_threshold strategy triggers remask when enabled"""
+        decoder = SlideWindowRCRDecoder(
+            temperature=0.0,
+            threshold=0.9,
+            medium_threshold=0.8,
+            low_threshold=0.62,
+            window_size=3,
+            decline_threshold=0.1,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            enable_low_threshold=True,
+            enable_decline_threshold=False,
+            enable_consecutive_decline=False
+        )
+        
+        seq_len = 3
+        block_x = torch.full((1, seq_len), self.mask_id)
+        decoder.block_init(block_x, block_id=0)
+        
+        # First decode all positions
+        x = torch.full((1, seq_len), self.mask_id)
+        logits1 = torch.zeros(1, seq_len, self.vocab_size)
+        logits1[:, 0, 50] = 10.0
+        logits1[:, 1, 60] = 10.0
+        logits1[:, 2, 70] = 10.0
+        decoder.decode(logits1, 0, seq_len, x)
+        
+        # Build history for decline detection
+        for _ in range(2):
+            logits = torch.zeros(1, seq_len, self.vocab_size)
+            logits[:, 0, 50] = 5.0  # Medium confidence
+            logits[:, 1, 60] = 10.0
+            logits[:, 2, 70] = 10.0
+            decoder.decode(logits, 0, seq_len, x)
+        
+        decoder.reset_stats()
+        
+        # Now test: position 0 has low confidence (< 0.62), should trigger low_threshold
+        logits_low = torch.zeros(1, seq_len, self.vocab_size)
+        logits_low[:, 0, 50] = 0.3  # Very low confidence
+        logits_low[:, 1, 60] = 10.0
+        logits_low[:, 2, 70] = 10.0
+        decoder.decode(logits_low, 0, seq_len, x)
+        
+        stats = decoder.get_stats()
+        # Low threshold should trigger, but decline strategies should not
+        assert stats['remask_declining_count'] == 0
+        assert stats['remask_consecutive_declining_count'] == 0
+        print(f"enable_low_threshold_only stats: {stats}")
+    
+    def test_enable_decline_threshold_only(self):
+        """Test that only decline_threshold strategy triggers remask when enabled"""
+        decoder = SlideWindowRCRDecoder(
+            temperature=0.0,
+            threshold=0.9,
+            medium_threshold=0.8,
+            low_threshold=0.62,
+            window_size=3,
+            decline_threshold=0.1,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            enable_low_threshold=False,
+            enable_decline_threshold=True,
+            enable_consecutive_decline=False
+        )
+        
+        seq_len = 2
+        block_x = torch.full((1, seq_len), self.mask_id)
+        decoder.block_init(block_x, block_id=0)
+        
+        x = torch.full((1, seq_len), self.mask_id)
+        
+        # Step 1: Decode with high confidence
+        logits1 = torch.zeros(1, seq_len, self.vocab_size)
+        logits1[:, 0, 50] = 10.0  # High confidence
+        logits1[:, 1, 60] = 10.0
+        decoder.decode(logits1, 0, seq_len, x)
+        
+        # Step 2: Medium confidence
+        logits2 = torch.zeros(1, seq_len, self.vocab_size)
+        logits2[:, 0, 50] = 4.0
+        logits2[:, 1, 60] = 10.0
+        decoder.decode(logits2, 0, seq_len, x)
+        
+        decoder.reset_stats()
+        
+        # Step 3: Lower confidence, should trigger decline threshold
+        # conf < medium_threshold AND decline > decline_threshold
+        logits3 = torch.zeros(1, seq_len, self.vocab_size)
+        logits3[:, 0, 50] = 2.0  # Lower confidence, decline should be > 0.1
+        logits3[:, 1, 60] = 10.0
+        decoder.decode(logits3, 0, seq_len, x)
+        
+        stats = decoder.get_stats()
+        # Low threshold should NOT trigger (disabled)
+        assert stats['remask_low_conf_count'] == 0
+        # Consecutive decline should NOT trigger (disabled)
+        assert stats['remask_consecutive_declining_count'] == 0
+        print(f"enable_decline_threshold_only stats: {stats}")
+    
+    def test_enable_consecutive_decline_only(self):
+        """Test that only consecutive_decline strategy triggers remask when enabled"""
+        decoder = SlideWindowRCRDecoder(
+            temperature=0.0,
+            threshold=0.9,
+            medium_threshold=0.8,
+            low_threshold=0.62,
+            window_size=3,
+            decline_threshold=0.5,  # High threshold so decline_threshold won't trigger
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            enable_low_threshold=False,
+            enable_decline_threshold=False,
+            enable_consecutive_decline=True
+        )
+        
+        seq_len = 2
+        block_x = torch.full((1, seq_len), self.mask_id)
+        decoder.block_init(block_x, block_id=0)
+        
+        x = torch.full((1, seq_len), self.mask_id)
+        
+        # Step 1: Decode with high confidence
+        logits1 = torch.zeros(1, seq_len, self.vocab_size)
+        logits1[:, 0, 50] = 5.0
+        logits1[:, 1, 60] = 10.0
+        decoder.decode(logits1, 0, seq_len, x)
+        
+        # Step 2: Slightly lower
+        logits2 = torch.zeros(1, seq_len, self.vocab_size)
+        logits2[:, 0, 50] = 4.5
+        logits2[:, 1, 60] = 10.0
+        decoder.decode(logits2, 0, seq_len, x)
+        
+        decoder.reset_stats()
+        
+        # Step 3: Even lower - consecutive decline
+        logits3 = torch.zeros(1, seq_len, self.vocab_size)
+        logits3[:, 0, 50] = 4.0  # Consecutive decline: 5.0 -> 4.5 -> 4.0
+        logits3[:, 1, 60] = 10.0
+        decoder.decode(logits3, 0, seq_len, x)
+        
+        stats = decoder.get_stats()
+        # Low threshold should NOT trigger (disabled)
+        assert stats['remask_low_conf_count'] == 0
+        # Decline threshold should NOT trigger (disabled)
+        assert stats['remask_declining_count'] == 0
+        print(f"enable_consecutive_decline_only stats: {stats}")
+    
+    def test_no_remask_when_all_disabled(self):
+        """Test that no remask occurs when all strategies are disabled"""
+        decoder = SlideWindowRCRDecoder(
+            temperature=0.0,
+            threshold=0.9,
+            medium_threshold=0.8,
+            low_threshold=0.62,
+            window_size=3,
+            decline_threshold=0.1,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            enable_low_threshold=False,
+            enable_decline_threshold=False,
+            enable_consecutive_decline=False
+        )
+        
+        seq_len = 3
+        block_x = torch.full((1, seq_len), self.mask_id)
+        decoder.block_init(block_x, block_id=0)
+        
+        x = torch.full((1, seq_len), self.mask_id)
+        
+        # Decode all positions
+        logits1 = torch.zeros(1, seq_len, self.vocab_size)
+        logits1[:, 0, 50] = 10.0
+        logits1[:, 1, 60] = 10.0
+        logits1[:, 2, 70] = 10.0
+        decoder.decode(logits1, 0, seq_len, x)
+        
+        # Build history
+        for _ in range(3):
+            logits = torch.zeros(1, seq_len, self.vocab_size)
+            logits[:, 0, 50] = 3.0  # Declining confidence
+            logits[:, 1, 60] = 10.0
+            logits[:, 2, 70] = 10.0
+            decoder.decode(logits, 0, seq_len, x)
+        
+        decoder.reset_stats()
+        
+        # Very low confidence - would trigger remask if enabled
+        logits_low = torch.zeros(1, seq_len, self.vocab_size)
+        logits_low[:, 0, 50] = 0.1  # Very low
+        logits_low[:, 1, 60] = 10.0
+        logits_low[:, 2, 70] = 10.0
+        decoder.decode(logits_low, 0, seq_len, x)
+        
+        stats = decoder.get_stats()
+        assert stats['total_remask_count'] == 0
+        assert stats['remask_low_conf_count'] == 0
+        assert stats['remask_declining_count'] == 0
+        assert stats['remask_consecutive_declining_count'] == 0
+        print(f"no_remask_when_all_disabled stats: {stats}")
+    
+    def test_decline_strategies_extended_range_when_low_disabled(self):
+        """
+        Test that when enable_low_threshold=False, decline strategies apply to
+        the full range of curr_conf < medium_threshold (including < low_threshold).
+        """
+        decoder = SlideWindowRCRDecoder(
+            temperature=0.0,
+            threshold=0.9,
+            medium_threshold=0.8,
+            low_threshold=0.62,
+            window_size=3,
+            decline_threshold=0.1,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            enable_low_threshold=False,  # Disabled
+            enable_decline_threshold=True,  # Enabled
+            enable_consecutive_decline=False
+        )
+        
+        seq_len = 2
+        block_x = torch.full((1, seq_len), self.mask_id)
+        decoder.block_init(block_x, block_id=0)
+        
+        x = torch.full((1, seq_len), self.mask_id)
+        
+        # Step 1: Decode with high confidence
+        logits1 = torch.zeros(1, seq_len, self.vocab_size)
+        logits1[:, 0, 50] = 10.0
+        logits1[:, 1, 60] = 10.0
+        decoder.decode(logits1, 0, seq_len, x)
+        
+        # Step 2: Medium confidence
+        logits2 = torch.zeros(1, seq_len, self.vocab_size)
+        logits2[:, 0, 50] = 3.0
+        logits2[:, 1, 60] = 10.0
+        decoder.decode(logits2, 0, seq_len, x)
+        
+        decoder.reset_stats()
+        
+        # Step 3: Very low confidence (< low_threshold), but decline strategy should still apply
+        # because enable_low_threshold=False means we don't skip with continue
+        logits3 = torch.zeros(1, seq_len, self.vocab_size)
+        logits3[:, 0, 50] = 0.5  # Very low, < low_threshold=0.62
+        logits3[:, 1, 60] = 10.0
+        decoder.decode(logits3, 0, seq_len, x)
+        
+        stats = decoder.get_stats()
+        # Low threshold should NOT trigger (disabled)
+        assert stats['remask_low_conf_count'] == 0
+        # Decline threshold SHOULD trigger (enabled and conf < medium_threshold)
+        # The decline from ~0.99 to ~0.5 is definitely > 0.1
+        print(f"decline_strategies_extended_range stats: {stats}")
+
+
+class TestSlideWindowRCRDecoderVsThreshold:
+    """Test that SlideWindowRCRDecoder with all strategies disabled behaves like ThresholdParallelDecoder"""
+    
+    def setup_method(self):
+        self.mask_id = 126336
+        self.eos_id = 126081
+        self.vocab_size = 100
+    
+    def test_same_result_single_step(self):
+        """Test that both decoders produce the same result in a single decode step"""
+        threshold = 0.9
+        temperature = 0.0
+        
+        slide_decoder = SlideWindowRCRDecoder(
+            temperature=temperature,
+            threshold=threshold,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            enable_low_threshold=False,
+            enable_decline_threshold=False,
+            enable_consecutive_decline=False
+        )
+        
+        threshold_decoder = ThresholdParallelDecoder(
+            temperature=temperature,
+            threshold=threshold,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id
+        )
+        
+        seq_len = 5
+        
+        # Initialize both decoders
+        block_x = torch.full((1, seq_len), self.mask_id)
+        slide_decoder.block_init(block_x, block_id=0)
+        threshold_decoder.block_init(block_x, block_id=0)
+        
+        # Create identical inputs
+        logits = torch.zeros(1, seq_len, self.vocab_size)
+        logits[:, 0, 50] = 10.0  # High confidence
+        logits[:, 1, 60] = 5.0   # Medium confidence
+        logits[:, 2, 70] = 2.0   # Low confidence
+        logits[:, 3, 80] = 10.0  # High confidence
+        logits[:, 4, 90] = 10.0  # High confidence
+        
+        x_slide = torch.full((1, seq_len), self.mask_id)
+        x_threshold = torch.full((1, seq_len), self.mask_id)
+        
+        slide_decoder.decode(logits.clone(), 0, seq_len, x_slide)
+        threshold_decoder.decode(logits.clone(), 0, seq_len, x_threshold)
+        
+        print(f"SlideWindowRCR result: {x_slide.tolist()}")
+        print(f"Threshold result: {x_threshold.tolist()}")
+        
+        assert torch.equal(x_slide, x_threshold), \
+            f"Results differ: slide={x_slide.tolist()}, threshold={x_threshold.tolist()}"
+    
+    def test_same_result_multiple_steps(self):
+        """Test that both decoders produce the same result over multiple decode steps"""
+        threshold = 0.9
+        temperature = 0.0
+        
+        slide_decoder = SlideWindowRCRDecoder(
+            temperature=temperature,
+            threshold=threshold,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            enable_low_threshold=False,
+            enable_decline_threshold=False,
+            enable_consecutive_decline=False
+        )
+        
+        threshold_decoder = ThresholdParallelDecoder(
+            temperature=temperature,
+            threshold=threshold,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id
+        )
+        
+        seq_len = 5
+        
+        # Initialize both decoders
+        block_x = torch.full((1, seq_len), self.mask_id)
+        slide_decoder.block_init(block_x, block_id=0)
+        threshold_decoder.block_init(block_x, block_id=0)
+        
+        x_slide = torch.full((1, seq_len), self.mask_id)
+        x_threshold = torch.full((1, seq_len), self.mask_id)
+        
+        # Run multiple decode steps
+        for step in range(5):
+            # Create logits that gradually increase confidence
+            logits = torch.zeros(1, seq_len, self.vocab_size)
+            for i in range(seq_len):
+                logits[:, i, 50 + i] = 3.0 + step * 2  # Increasing confidence
+            
+            slide_decoder.decode(logits.clone(), 0, seq_len, x_slide)
+            threshold_decoder.decode(logits.clone(), 0, seq_len, x_threshold)
+            
+            print(f"Step {step + 1}: slide={x_slide.tolist()}, threshold={x_threshold.tolist()}")
+            
+            assert torch.equal(x_slide, x_threshold), \
+                f"Step {step + 1} results differ: slide={x_slide.tolist()}, threshold={x_threshold.tolist()}"
+        
+        print("✓ All steps produced identical results")
+    
+    def test_same_result_with_varying_confidence(self):
+        """Test with varying confidence patterns"""
+        threshold = 0.9
+        temperature = 0.0
+        
+        slide_decoder = SlideWindowRCRDecoder(
+            temperature=temperature,
+            threshold=threshold,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            enable_low_threshold=False,
+            enable_decline_threshold=False,
+            enable_consecutive_decline=False
+        )
+        
+        threshold_decoder = ThresholdParallelDecoder(
+            temperature=temperature,
+            threshold=threshold,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id
+        )
+        
+        seq_len = 4
+        
+        block_x = torch.full((1, seq_len), self.mask_id)
+        slide_decoder.block_init(block_x, block_id=0)
+        threshold_decoder.block_init(block_x, block_id=0)
+        
+        x_slide = torch.full((1, seq_len), self.mask_id)
+        x_threshold = torch.full((1, seq_len), self.mask_id)
+        
+        # Test with different confidence patterns
+        confidence_patterns = [
+            [10.0, 10.0, 10.0, 10.0],  # All high
+            [1.0, 1.0, 1.0, 1.0],      # All low
+            [10.0, 1.0, 10.0, 1.0],    # Alternating
+            [1.0, 5.0, 8.0, 10.0],     # Increasing
+        ]
+        
+        for pattern in confidence_patterns:
+            # Reset
+            x_slide = torch.full((1, seq_len), self.mask_id)
+            x_threshold = torch.full((1, seq_len), self.mask_id)
+            slide_decoder.block_init(torch.full((1, seq_len), self.mask_id), block_id=0)
+            threshold_decoder.block_init(torch.full((1, seq_len), self.mask_id), block_id=0)
+            
+            logits = torch.zeros(1, seq_len, self.vocab_size)
+            for i, conf in enumerate(pattern):
+                logits[:, i, 50 + i] = conf
+            
+            slide_decoder.decode(logits.clone(), 0, seq_len, x_slide)
+            threshold_decoder.decode(logits.clone(), 0, seq_len, x_threshold)
+            
+            print(f"Pattern {pattern}: slide={x_slide.tolist()}, threshold={x_threshold.tolist()}")
+            
+            assert torch.equal(x_slide, x_threshold), \
+                f"Pattern {pattern} results differ"
+        
+        print("✓ All patterns produced identical results")
+    
+    def test_no_remask_stats_when_disabled(self):
+        """Test that remask statistics are all zero when strategies are disabled"""
+        slide_decoder = SlideWindowRCRDecoder(
+            temperature=0.0,
+            threshold=0.9,
+            mask_id=self.mask_id,
+            eos_id=self.eos_id,
+            enable_low_threshold=False,
+            enable_decline_threshold=False,
+            enable_consecutive_decline=False
+        )
+        
+        seq_len = 3
+        block_x = torch.full((1, seq_len), self.mask_id)
+        slide_decoder.block_init(block_x, block_id=0)
+        
+        x = torch.full((1, seq_len), self.mask_id)
+        
+        # Run multiple steps with varying confidence
+        for step in range(5):
+            logits = torch.zeros(1, seq_len, self.vocab_size)
+            # Create declining confidence pattern that would trigger remask if enabled
+            for i in range(seq_len):
+                logits[:, i, 50 + i] = max(0.5, 10.0 - step * 2)
+            
+            slide_decoder.decode(logits, 0, seq_len, x)
+        
+        stats = slide_decoder.get_stats()
+        assert stats['total_remask_count'] == 0
+        assert stats['remask_low_conf_count'] == 0
+        assert stats['remask_declining_count'] == 0
+        assert stats['remask_consecutive_declining_count'] == 0
+        print(f"✓ No remask occurred: {stats}")
+
+
 def run_tests():
     """Run all tests"""
     print("Running SlideWindowRCRDecoder tests...")
@@ -667,6 +1181,52 @@ def run_tests():
     flow_test_class.setup_method()
     flow_test_class.test_declining_trend_triggers_remask()
     print("✓ test_declining_trend_triggers_remask passed")
+    
+    # Enable flags tests
+    enable_test_class = TestSlideWindowRCRDecoderEnableFlags()
+    
+    enable_test_class.setup_method()
+    enable_test_class.test_default_all_disabled()
+    print("✓ test_default_all_disabled passed")
+    
+    enable_test_class.setup_method()
+    enable_test_class.test_enable_low_threshold_only()
+    print("✓ test_enable_low_threshold_only passed")
+    
+    enable_test_class.setup_method()
+    enable_test_class.test_enable_decline_threshold_only()
+    print("✓ test_enable_decline_threshold_only passed")
+    
+    enable_test_class.setup_method()
+    enable_test_class.test_enable_consecutive_decline_only()
+    print("✓ test_enable_consecutive_decline_only passed")
+    
+    enable_test_class.setup_method()
+    enable_test_class.test_no_remask_when_all_disabled()
+    print("✓ test_no_remask_when_all_disabled passed")
+    
+    enable_test_class.setup_method()
+    enable_test_class.test_decline_strategies_extended_range_when_low_disabled()
+    print("✓ test_decline_strategies_extended_range_when_low_disabled passed")
+    
+    # Comparison tests with ThresholdParallelDecoder
+    compare_test_class = TestSlideWindowRCRDecoderVsThreshold()
+    
+    compare_test_class.setup_method()
+    compare_test_class.test_same_result_single_step()
+    print("✓ test_same_result_single_step passed")
+    
+    compare_test_class.setup_method()
+    compare_test_class.test_same_result_multiple_steps()
+    print("✓ test_same_result_multiple_steps passed")
+    
+    compare_test_class.setup_method()
+    compare_test_class.test_same_result_with_varying_confidence()
+    print("✓ test_same_result_with_varying_confidence passed")
+    
+    compare_test_class.setup_method()
+    compare_test_class.test_no_remask_stats_when_disabled()
+    print("✓ test_no_remask_stats_when_disabled passed")
     
     print("\n✅ All tests passed!")
 

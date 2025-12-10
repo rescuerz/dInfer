@@ -530,7 +530,8 @@ class SlideWindowRCRDecoder(ParallelDecoder):
     
     def __init__(self, temperature, threshold=0.9, medium_threshold=0.8, 
                  low_threshold=0.62, window_size=3, decline_threshold=0.1,
-                 mask_id=126336, eos_id=126081, use_float64=False, debug=False, tokenizer=None):
+                 mask_id=126336, eos_id=126081, use_float64=False, debug=False, tokenizer=None,
+                 enable_low_threshold=False, enable_decline_threshold=False, enable_consecutive_decline=False):
         super().__init__(temperature, 'low_confidence', mask_id)
         self.threshold = threshold
         self.medium_threshold = medium_threshold
@@ -541,6 +542,11 @@ class SlideWindowRCRDecoder(ParallelDecoder):
         self.use_float64 = use_float64
         self.debug = debug
         self.tokenizer = tokenizer
+        
+        # Enable flags for remask strategies
+        self.enable_low_threshold = enable_low_threshold
+        self.enable_decline_threshold = enable_decline_threshold
+        self.enable_consecutive_decline = enable_consecutive_decline
         
         # Confidence history: list of tensors, each shape [1, seq_len]
         # -inf means the position is mask or not yet tracked
@@ -675,8 +681,12 @@ class SlideWindowRCRDecoder(ParallelDecoder):
         """ Compute which decoded positions should be remasked.
         
         Remask conditions (only for decoded positions that are NOT prompt):
-        1. confidence < low_threshold (absolute low)
-        2. confidence < medium_threshold AND _is_declining (trend-based or consecutive)
+        1. confidence < low_threshold (absolute low) - controlled by enable_low_threshold
+        2. confidence < medium_threshold AND decline > decline_threshold - controlled by enable_decline_threshold
+        3. confidence < medium_threshold AND consecutive declining - controlled by enable_consecutive_decline
+        
+        When enable_low_threshold=False, strategies 2 and 3 apply to the full range
+        of curr_conf < medium_threshold (not limited by low_threshold).
         
         Note: Prompt positions (non-mask at block_init) are never remasked.
         
@@ -708,21 +718,26 @@ class SlideWindowRCRDecoder(ParallelDecoder):
             
             curr_conf = confidence[0, j].item()
             
-            # Condition 1: absolute low confidence
-            if curr_conf < self.low_threshold:
+            # Strategy 1: absolute low confidence (when enabled)
+            if self.enable_low_threshold and curr_conf < self.low_threshold:
                 remask_index[0, j] = True
                 remask_low_conf_indices.append(j)
                 continue
             
-            # Condition 2: medium confidence + declining trend
+            # Strategy 2 & 3: declining trend detection (when enabled)
+            # When enable_low_threshold=True: only check in range [low_threshold, medium_threshold)
+            # When enable_low_threshold=False: check in full range (0, medium_threshold)
             if curr_conf < self.medium_threshold:
-                is_declining, decline_type = self._is_declining(j, curr_conf)
-                if is_declining:
-                    remask_index[0, j] = True
-                    if decline_type == 'threshold':
-                        remask_declining_indices.append(j)
-                    elif decline_type == 'consecutive':
-                        remask_consecutive_declining_indices.append(j)
+                if self.enable_decline_threshold or self.enable_consecutive_decline:
+                    is_declining, decline_type = self._is_declining(j, curr_conf)
+                    if is_declining:
+                        # Check if the specific strategy is enabled
+                        if decline_type == 'threshold' and self.enable_decline_threshold:
+                            remask_index[0, j] = True
+                            remask_declining_indices.append(j)
+                        elif decline_type == 'consecutive' and self.enable_consecutive_decline:
+                            remask_index[0, j] = True
+                            remask_consecutive_declining_indices.append(j)
         
         return remask_index, remask_low_conf_indices, remask_declining_indices, remask_consecutive_declining_indices
     
