@@ -29,6 +29,7 @@ requirements = [
     'scipy',
     'tqdm',
     'vllm==0.10.2',
+    'sglang==0.5.3.post1',
 ]
 
 extensions = []
