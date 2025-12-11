@@ -5,7 +5,7 @@ import logging
 from transformers.models.layoutlmv2.modeling_layoutlmv2 import relative_position_bucket
 
 from .utils import TokenArray, DistAlignedTokenArray, gather_sequence_block
-from .utils import calculate_op_num
+from .utils import calculate_op_num, BlockLoc
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,9 @@ class BlockDiffusionRunner(BlockRunner):
     def __init__(self, diff_iteration, early_stop, maximum_unroll, expected_tpf, backend):
         super().__init__(diff_iteration, early_stop, maximum_unroll, expected_tpf)
         self.backend = backend
+        self.cache_update_count = 0
+        self.hidden_cache_update_count = 0
+        self.need_cross_block_update = False
 
     def prefill(self, model, block, kv_cache, pos_ids, attn_mask):
         """ Prefill for KV Cache
@@ -159,8 +162,9 @@ class BlockDiffusionRunner(BlockRunner):
                 kv_cache.range_update(output.past_key_values, 0, block.size(1), 0)
             self.diff_iteration.num_forwards +=1
             self.diff_iteration.iter_no +=1
+        self.need_cross_block_update = False
 
-    def decode(self, model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask):
+    def decode(self, model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask, block_length=32, cross_block_attn_mask=None):
         """ Decode all tokens in a block.
 
         Parameters
@@ -201,31 +205,46 @@ class BlockDiffusionRunner(BlockRunner):
 
         input_block_mask_number = 0
         while (block == decoder.mask_id).sum() > 0:
-            unroll_k = int(max(min((block == decoder.mask_id).sum()//self.expected_tpf, self.maximum_unroll), 2))
+            unroll_k = int(max(min((block == decoder.mask_id).sum()//self.expected_tpf, self.maximum_unroll), 1))
             for unroll_i in range(unroll_k):
                 input_block_mask_number = (block == decoder.mask_id).sum()
-                output = self.diff_iteration.forward(model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask, past_key_values, replace_position, self.backend)
+                if self.need_cross_block_update:
+                    cross_block_loc = BlockLoc(block_loc.start-block_length, block_loc.end)
+                    cross_block_x = x[:, block_loc.start-block_length:block_loc.end]
+                    cross_block_replace_positions = (block_loc.start-block_length, block_loc.end)
+                    output = self.diff_iteration.forward(model, decoder, x, kv_cache, cross_block_x, cross_block_loc, 
+                                block_id, pos_ids, cross_block_attn_mask, past_key_values, cross_block_replace_positions, 
+                                self.backend, is_cross_block=True, block_length=block_length)
+                    if self.backend=='vllm':
+                        if isinstance(output.past_key_values, list):
+                            kv_cache.update([past_key_value[:, :, :block_loc.start] for past_key_value in output.past_key_values])
+                        else:
+                            kv_cache.update(output.past_key_values._data[:, :, :, :, :block_loc.start])
+                        kv_cache.extend_cache(block_loc.end)
+                    else:
+                        last_block_past_key_values = [past_key_value[:, :, :block_loc.start-block_loc.end] for past_key_value in output.past_key_values]
+                        kv_cache.range_update(last_block_past_key_values, 0, block_loc.start, block_length)
+                    past_key_values, replace_position = kv_cache.get_key_values(block_loc.start, block_loc.end)
+                    self.need_cross_block_update = False
+                else:
+                    output = self.diff_iteration.forward(model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask, past_key_values, replace_position, self.backend)
             if batch_size > 1:
                 seq_idx, x = select_undecoded(seq_idx, orig_x, x, block, block_loc, decoder.mask_id, writeback=True)
                 block = x[:, block_loc.start:block_loc.end]
                 # If all blocks have been decoded, we can jumpt out.
                 if len(seq_idx) == 0:
                     break
-        # additional forward to update kvcache for the last decoding step in the current block
         if kv_cache is not None:
+            self.cache_update_count += 1
             if input_block_mask_number > 0:
-                output = model(block.clone(memory_format=torch.contiguous_format), 
-                    past_key_values=past_key_values,
-                    use_cache=True, 
-                    position_ids=pos_ids[:, block_loc.start:block_loc.end].clone(memory_format=torch.contiguous_format),
-                    replace_position=(0,0) if self.backend=='sglang' else replace_position)
-                self.diff_iteration.num_forwards +=1
-                self.diff_iteration.iter_no +=1
-            if self.backend=='vllm':
-                kv_cache.update(output.past_key_values)
+                self.need_cross_block_update = True
             else:
-                kv_cache.range_update(output.past_key_values, 0, block_loc.end, block_loc.end - block_loc.start)
-
+                self.need_cross_block_update = False
+                self.hidden_cache_update_count += 1
+                if self.backend=='vllm':
+                    kv_cache.update(output.past_key_values)
+                else:
+                    kv_cache.range_update(output.past_key_values, 0, block_loc.end, block_loc.end - block_loc.start)
 
 
         eos_idx = torch.any(orig_x[:, block_loc.start:block_loc.end] == decoder.eos_id, dim=1)
@@ -313,7 +332,7 @@ class BlockDiffusionIteration:
         self.cache_updates = 0
         self.iter_no = 0
 
-    def forward(self, model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask, past_key_values, replace_position, backend):
+    def forward(self, model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask, past_key_values, replace_position, backend, is_cross_block=False, block_length=32):
         """ Decode tokens in a forward run on a block.
 
         The forward run decodes tokens in the input array.
@@ -349,17 +368,27 @@ class BlockDiffusionIteration:
                 position_ids=pos_ids[:, :block_loc.end])
             logits = output.logits[:, block_loc.start:block_loc.end]
         else:
-            output = model(block.clone(memory_format=torch.contiguous_format),
-                position_ids=pos_ids[:,block_loc.start:block_loc.end].clone(memory_format=torch.contiguous_format),
-                use_cache=True,
-                past_key_values=past_key_values,
-                replace_position=(0,0) if backend=='sglang' else replace_position)
+            if is_cross_block:
+                output = model(block.clone(memory_format=torch.contiguous_format),
+                    position_ids=pos_ids[:,block_loc.start:block_loc.end].clone(memory_format=torch.contiguous_format),
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                    attention_mask=attn_mask,
+                    replace_position=(0,0) if backend=='sglang' else replace_position)
+            else:
+                output = model(block.clone(memory_format=torch.contiguous_format),
+                    position_ids=pos_ids[:,block_loc.start:block_loc.end].clone(memory_format=torch.contiguous_format),
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                    replace_position=(0,0) if backend=='sglang' else replace_position)
             logits = output.logits
             # TODO(dulun): we don't need update kv cache for every step.
             if backend == 'vllm':
                 kv_cache.update(output.past_key_values)
-            
-        decoder.decode(logits, block_loc.start, block_loc.end, x)
+        if is_cross_block:
+            decoder.decode(logits[:, block_length:], block_loc.start+block_length, block_loc.end, x)
+        else: 
+            decoder.decode(logits, block_loc.start, block_loc.end, x)
         self.num_forwards += 1
         self.iter_no += 1
         return output
@@ -923,6 +952,7 @@ class BlockDiffusionLLM(DiffusionLLM):
         self.diff_iteration = BlockDiffusionIteration()
         self.block_runner = BlockDiffusionRunner(self.diff_iteration, early_stop, maximum_unroll, expected_tpf, backend)
         self.early_stop = early_stop
+        self.backend = backend
 
     @property
     def num_forwards(self):
@@ -944,9 +974,12 @@ class BlockDiffusionLLM(DiffusionLLM):
         num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
         total_length = num_blocks * block_length
         new_gen_length=total_length-prompt_length
+        
+        mask_length = (max(self.cache_factory.max_length, prompt_length + gen_length)+block_length-1)//block_length*block_length
+        attn_mask_num_blocks = mask_length // block_length
 
         # prepare block_mask and position IDs
-        block_mask = torch.tril(torch.ones(num_blocks, num_blocks, device=self.model.device))
+        block_mask = torch.tril(torch.ones(attn_mask_num_blocks, attn_mask_num_blocks, device=self.model.device, dtype=torch.bool))
         bd_attn_mask = block_mask.repeat_interleave(block_length, dim=0)\
                                         .repeat_interleave(block_length, dim=1).unsqueeze(0).repeat(batch_size, 1, 1)
         pos_ids = torch.arange(total_length, device=self.model.device).unsqueeze(0).repeat(batch_size, 1)
@@ -966,7 +999,12 @@ class BlockDiffusionLLM(DiffusionLLM):
         self.diff_iteration.iter_no = 0
         for block_id, (block_loc, block) in enumerate(it):
             self.decoder.block_init(block, block_id)
-            decode_compl = self.block_runner.decode(self.model, self.decoder, x, kv_cache, block, block_loc, block_id, pos_ids, bd_attn_mask)
+            if self.backend == 'vllm':
+                cross_block_attn_mask = bd_attn_mask[:,block_loc.start-block_length:block_loc.end, :block_loc.end]
+            else:
+                cross_block_attn_mask = torch.ones(batch_size, 2*block_length, kv_cache.past_key_values._data.shape[4], device=prompt.device, dtype=torch.bool)
+                cross_block_attn_mask[:, :block_length, -block_length:].fill_(False)
+            decode_compl = self.block_runner.decode(self.model, self.decoder, x, kv_cache, block, block_loc, block_id, pos_ids, bd_attn_mask, block_length, cross_block_attn_mask)
             if torch.all(decode_compl) and self.early_stop:
                 break
         logger.info(f'The number of diffusion iterations: {self.num_forwards}')

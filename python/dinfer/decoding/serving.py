@@ -1,7 +1,8 @@
 import os
 import logging
 import multiprocessing as mp
-
+import traceback
+from queue import Empty
 import torch
 import torch.distributed as dist
 from vllm import distributed as vllm_dist
@@ -50,7 +51,7 @@ class SamplingParams:
     """
     def __init__(self, threshold=0.9, low_threshold=0.6, cache='dual', temperature=0., early_stop=True, cont_weight=0.3,
             prefix_look=16, after_look=16, warmup_steps=4, enable_torch_compile=True, mask_id=156895, eos_id=156892, 
-            parallel_decoding='threshold', use_credit=False, use_bd=True, max_length=4096):
+            parallel_decoding='threshold', use_credit=False, use_bd=True, max_length=4096, ep_size=1):
         self.threshold = threshold
         self.low_threshold = low_threshold
         self.cache = cache
@@ -67,6 +68,7 @@ class SamplingParams:
         self.use_credit = use_credit
         self.use_bd = use_bd
         self.max_length = max_length
+        self.ep_size = ep_size
 
 def init_generator(model, sample_params, backend='vllm', max_length=4096):
     if sample_params.parallel_decoding == 'threshold':
@@ -104,7 +106,7 @@ def init_generator(model, sample_params, backend='vllm', max_length=4096):
                     early_stop=sample_params.early_stop)
     else:
         dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), 
-            cache_factory=cache_factory, early_stop=sample_params.early_stop, maximum_unroll=4, expected_tpf=4, backend=backend)
+            cache_factory=cache_factory, early_stop=sample_params.early_stop, maximum_unroll=2, expected_tpf=15, backend=backend)
 
     return dllm
 
@@ -116,13 +118,24 @@ def generate(dllm, device, req_q, res_q):
             break
         else:
             input_ids, gen_len, block_len = data
+        input_ids = input_ids.to(device)
         out = dllm.generate(input_ids, gen_length=gen_len, block_length=block_len)
         num_forwards = dllm.num_forwards
         if res_q is not None:
             res_q.put((out, num_forwards))
+def sglang_llada2_server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port, error_q=None):
+    try:
+        _sglang_llada2_server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port)
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        logger.error(f"[SERVER PROCESS {rank} ERROR]: {error_msg}")
+        if error_q is not None:
+            try:
+                error_q.put((e, error_msg))
+            except:
+                logger.error(f"[ERROR_Q exception in {rank}].")
 
-
-def sglang_llada2_server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port):
+def _sglang_llada2_server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port):
     torch.cuda.set_device(gpu_id)
     device = torch.device(gpu_id)
     logger.info(f'start v2 server. server port: {master_port}')
@@ -131,11 +144,11 @@ def sglang_llada2_server_process(model_path, sample_params, world_size, rank, gp
     os.environ['MASTER_PORT'] = str(master_port)
     from sglang.srt import distributed
     distributed.init_distributed_environment(world_size, rank, 'env://', rank, 'nccl')
-    distributed.initialize_model_parallel(world_size, world_size, 1, backend='nccl')
+    distributed.initialize_model_parallel(world_size, sample_params.ep_size, 1, backend='nccl')
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.layers.moe import initialize_moe_config
-    from dinfer.model.modeling_llada2_moe_sglang import LLaDA2SGLangLM
-    from dinfer.decoding.diffusion_runner import ModelRunner
+    from ..model.modeling_llada2_moe_sglang import LLaDA2SGLangLM
+    from .diffusion_runner import ModelRunner
     from sglang.srt.layers.dp_attention import initialize_dp_attention
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     server_args = ServerArgs(model_path=model_path, enable_dp_attention=True, trust_remote_code=True, tp_size=world_size, dp_size = 1, pp_size = 1)
@@ -163,7 +176,19 @@ def sglang_llada2_server_process(model_path, sample_params, world_size, rank, gp
     dllm = init_generator(model, sample_params, backend='sglang', max_length=max_length)
     generate(dllm, model.device, req_q=q, res_q=res_q)
 
-def moe_server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port):
+def moe_server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port, error_q=None):
+    try:
+        _moe_server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port)
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        logger.error(f"[SERVER PROCESS {rank} ERROR]: {error_msg}")
+        if error_q is not None:
+            try:
+                error_q.put((e, error_msg))
+            except:
+                logger.error(f"[ERROR_Q exception in {rank}].")
+
+def _moe_server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port):
     torch.cuda.set_device(gpu_id)
     device = torch.device(gpu_id)
     logger.info(f'start MOE server. server port: {master_port}')
@@ -190,8 +215,19 @@ def moe_server_process(model_path, sample_params, world_size, rank, gpu_id, q, r
     # TODO(zhengda) we should destroy the distributed environment. However, the function hangs if TP/EP is turned on.
     #vllm_dist.destroy_distributed_environment()
 
-def server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port):
-    torch.cuda.set_device(gpu_id)
+def server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port, error_q=None):
+    try:
+        _server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port)
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        logger.error(f"[SERVER PROCESS {rank} ERROR]: {error_msg}")
+        if error_q is not None:
+            try:
+                error_q.put((e, error_msg))
+            except:
+                logger.error(f"[ERROR_Q exception in {rank}].")
+
+def _server_process(model_path, sample_params, world_size, rank, gpu_id, q, res_q, master_port):
     device = torch.device(gpu_id)
 
     os.environ['MASTER_ADDR'] = '127.0.0.1'
@@ -217,20 +253,36 @@ class ServerGroup:
         self.procs = []
         self.req_qs = []
         self.res_q = None
+        self.error_qs = [] 
 
     def add_request(self, req):
         assert len(self.req_qs) != 0 and len(self.req_qs) == len(self.procs)
         for q in self.req_qs:
             q.put(req)
 
-    def get_response(self):
-        return self.res_q.get()
+    def get_response(self, timeout=None):
+        for i, eq in enumerate(self.error_qs):
+            if not eq.empty():
+                (e, error_msg) = eq.get_nowait()
+                print(f"Worker {i} failed: {error_msg}")
+                raise e
+        try:
+            return self.res_q.get(timeout=timeout)
+        except Empty:
+            print(f"[FATAL ERROR] Response timeout - possible hang or crash.")
+            raise RuntimeError("Inference timed out or worker crashed.")
+
+    # def _handle_error(self, msg):
+    #     logger.error(f"[FATAL ERROR] {msg}")
+    #     self.stop_running()
+    #     raise RuntimeError(msg)
 
     def start_server(self, model_path, model_type, sample_params, server_port, gpus, backend):
         ctx = mp.get_context('spawn')
         assert len(self.procs) == 0, 'The server is already running.'
         procs = []
         req_qs = []
+        error_qs = [] 
         for i, gpu in enumerate(gpus):
             if i == 0:
                 res_q = ctx.Queue()
@@ -239,31 +291,33 @@ class ServerGroup:
                 res_q = None
             q = ctx.Queue()
             req_qs.append(q)
+            error_q = ctx.Queue()  
+            error_qs.append(error_q)
             if backend=='sglang':
                 assert model_type.startswith('llada2')
-                p = ctx.Process(target=sglang_llada2_server_process, args=(model_path, sample_params, len(gpus), i, gpu, q, res_q, server_port))
+                p = ctx.Process(target=sglang_llada2_server_process, args=(model_path, sample_params, len(gpus), i, gpu, q, res_q, server_port, error_q))
             elif model_type=='llada-moe':
-                p = ctx.Process(target=moe_server_process, args=(model_path, sample_params, len(gpus), i, gpu, q, res_q, server_port))
+                p = ctx.Process(target=moe_server_process, args=(model_path, sample_params, len(gpus), i, gpu, q, res_q, server_port, error_q))
             else:
-                p = ctx.Process(target=server_process, args=(model_path, sample_params, len(gpus), i, gpu, q, res_q, server_port))
+                p = ctx.Process(target=server_process, args=(model_path, sample_params, len(gpus), i, gpu, q, res_q, server_port, error_q))
             p.daemon = True
             procs.append(p)
             p.start()
         self.procs = procs
         self.req_qs = req_qs
+        self.error_qs = error_qs  
 
     def is_running(self):
         return len(self.procs) != 0
 
     def stop_running(self):
-        for q in self.req_qs:
-            q.put('stop')
         for p in self.procs:
+            p.kill()
             p.join()
-
         self.procs = []
         self.req_qs = []
-        self.req_q = None
+        self.error_qs = [] 
+        self.res_q = None
 
 class ServerHandle:
     def __init__(self):
@@ -275,10 +329,10 @@ class ServerHandle:
         for i, prompt in enumerate(prompts):
             self.groups[i].add_request((prompt.unsqueeze(0), gen_length, block_length))
 
-    def get_responses(self):
+    def get_responses(self, timeout=None):
         res = []
         for group in self.groups:
-            res.append(group.get_response())
+            res.append(group.get_response(timeout=timeout))
         return res
 
     def start_server(self, model_path, model_type, sample_params, server_port, num_gpus, dp_size, tpep_size, backend):
@@ -322,7 +376,7 @@ class DiffusionLLMServing:
     num_gpus : int
         The number of GPUs used for parallel computation.
     """
-    def __init__(self, model, model_type='llada2', sample_params=None, server_port=12345, num_gpus=None, dp_size=None, tpep_size=None, backend='sglang'):
+    def __init__(self, model, model_type='llada2', sample_params=None, server_port=12345, num_gpus=None, dp_size=None, tpep_size=None, backend='sglang', timeout = None):
         if sample_params is None:
             sample_params = SamplingParams()
         self.sample_params = sample_params
@@ -336,6 +390,7 @@ class DiffusionLLMServing:
         if not handle.is_running():
             handle.start_server(model, model_type, sample_params, server_port, num_gpus, dp_size, tpep_size, backend)
         self.num_forwards = 0
+        self.timeout = timeout
 
     def generate(self, prompts, gen_length=128, block_length=128):
         ''' Generate tokens with diffusion iterations.
@@ -356,7 +411,7 @@ class DiffusionLLMServing:
         '''
         prompts = prompts.cpu()
         handle.add_requests((prompts, gen_length, block_length))
-        rets = handle.get_responses()
+        rets = handle.get_responses(timeout=self.timeout)
         max_len = max([tensor.shape[1] for (tensor, _) in rets])
         res = torch.zeros(len(rets), max_len, dtype=rets[0][0].dtype)
         res[:] = self.sample_params.eos_id

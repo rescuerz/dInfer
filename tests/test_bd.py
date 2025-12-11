@@ -21,8 +21,8 @@ from dinfer import ThresholdParallelDecoder, BlockDiffusionLLMAttnmask, BlockDif
 import difflib
 
 #model_path = '/mnt/dllm/luxiaocheng/moe-mini-v2-e256-1009-fp8-ml4-grouprouter-20T-mdmcpt-block-diffusion-bl32-4k-noshift-100B'
-model_path = '/mnt/infra/dulun.dl/models/dllm-mini/block-diffusion-sft-2k-v2-full-bd/LLaDA2-mini-preview-ep4-v0'
-#model_path = '/mnt/infra/dulun.dl/models/dllm-mini/block-diffusion-sft-2k-v2-full-bd/LLaDA2-mini-preview-ep4-v0'
+# model_path = '/mnt/infra/dulun.dl/models/dllm-mini/block-diffusion-sft-2k-v2-full-bd/LLaDA2-mini-preview-ep4-v0'
+model_path = '/mnt/infra/dulun.dl/models/LLaDA2.0-MoE-preview/LLaDA2.0-Mini-fusemoe/checkpoint-14845_fusemoe'
 dataset_path = '/ossfs/workspace/dumped_prompts'
 dataset='openai_humaneval'
 
@@ -32,7 +32,7 @@ sample_path = FILE_PATH.with_name(f"{FILE_PATH.stem}_sample.json")
 model = None
 gpu_id = 2
 device = torch.device(gpu_id)
-tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
 decoder = ThresholdParallelDecoder(temperature=0, threshold=0.9, mask_id=156895, eos_id=156892) 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -47,7 +47,7 @@ def init_vllm_dist(worker_id):
   # setup EP
   parallel_config = ParallelConfig(enable_expert_parallel = True)
   with set_current_vllm_config(VllmConfig(parallel_config = parallel_config)):
-      model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+      model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
       global model
       model = LLaDA2MoeModelLM(config=model_config).eval()
       model.load_weights(model_path, torch_dtype=torch.float32)
@@ -73,7 +73,9 @@ def run_bd(use_kvcache):
         dllm = BlockDiffusionLLMAttnmask(model, decoder, BlockIteratorFactory(use_block_diffusion=True), early_stop=True)
       else:
         dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(use_block_diffusion=True),  cache_factory=KVCacheFactory('prefix',is_bd_model=True), early_stop=True)
-      out = dllm.generate(input_ids, gen_length=256, block_length=32)
+      vllm_config = get_current_vllm_config()
+      with set_forward_context(None, vllm_config):
+        out = dllm.generate(input_ids, gen_length=256, block_length=32)
       new_ans = tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True)
       
       #assert(new_ans == sample['answer'])

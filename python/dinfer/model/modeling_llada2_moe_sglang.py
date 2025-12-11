@@ -29,6 +29,7 @@ from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 import tqdm
 from pathlib import Path
 import json
+import re
 from safetensors.torch import load_file
 import torch.distributed as dist
 
@@ -75,6 +76,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     parallel_state, divide,
     tensor_model_parallel_all_reduce,
+    get_moe_expert_parallel_world_size,
+    get_moe_expert_parallel_rank,
+    get_moe_tensor_parallel_world_size,
+    get_moe_tensor_parallel_rank,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -557,22 +562,6 @@ class LLaDA2SparseMoeBlock(nn.Module):
         if self.num_shared_experts > 0:
             shared_output = self.shared_experts(hidden_states)
         return shared_output
-
-
-    # def _save_record(self, tensor: torch.Tensor):
-    #     """将 (layer_id, stage, tensor, info) 追加保存到共享 .npy 文件"""
-    #     if tensor is None:
-    #         return
-    #     # 转为 CPU NumPy
-    #     tensor_np = tensor.detach().float().cpu().numpy()
-    #     # 准备记录元组
-    #     record = {
-    #         'layer_id': self.layer_id,
-    #         'tensor': tensor_np,
-    #     }
-    #     # 以追加模式写入 .npy
-    #     with open(self.topk_filename, 'ab') as f:
-    #         np.save(f, record)
             
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
@@ -581,12 +570,12 @@ class LLaDA2SparseMoeBlock(nn.Module):
         # self._save_record(topk_output.topk_ids)
         return self.experts(hidden_states, topk_output)
 
+    @torch.compiler.disable
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
-        # print('current_stream:', current_stream, 'alt_stream:', self.alt_stream)
         self.alt_stream.wait_stream(current_stream)
         router_output = self._forward_router_experts(hidden_states)
 
@@ -605,13 +594,6 @@ class LLaDA2SparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
 
         DUAL_STREAM_TOKEN_THRESHOLD = 1024
-        # print('moe input', hidden_states.shape)
-        # print( self.alt_stream is not None, hidden_states.shape[0] > 0,
-        #  hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD, get_is_capture_mode(), 
-        #  self.alt_stream is not None
-        #     and hidden_states.shape[0] > 0
-        #     and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
-        #     and get_is_capture_mode())
         if (
             self.alt_stream is not None
             and hidden_states.shape[0] > 0
@@ -734,14 +716,16 @@ class LLaDA2Attention(nn.Module):
         attn_tp_size = get_attention_tp_size()
 
         assert self.total_num_heads % attn_tp_size == 0
-        assert self.total_kv_heads % attn_tp_size == 0
         assert self.total_num_heads >= self.total_kv_heads
+        if attn_tp_size>self.total_kv_heads:
+            assert attn_tp_size%self.total_kv_heads==0
 
         self.num_heads = self.total_num_heads // attn_tp_size
         self.head_dim = config.head_dim if hasattr(config, 'head_dim') else (self.hidden_size // self.total_num_heads)
         self.q_size = self.head_dim * self.num_heads
 
-        self.num_kv_heads = self.total_kv_heads // attn_tp_size
+        self.num_kv_heads = max(1, self.total_kv_heads // attn_tp_size)
+        self.total_kv_heads = self.num_kv_heads*attn_tp_size
         self.kv_size = max(1, self.num_kv_heads * self.head_dim)
 
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
@@ -790,19 +774,21 @@ class LLaDA2Attention(nn.Module):
             max_position=config.max_position_embeddings,
             base=config.rope_theta,
             rope_scaling=config.rope_scaling,
+            dtype=torch.float32,
         )
-        # print(self.rotary_emb, self.rotary_emb.dtype)
-        # self.attn = RadixAttention(
-        #     self.num_heads,
-        #     self.head_dim,
-        #     self.scale,
-        #     num_kv_heads=self.num_kv_heads,
-        #     layer_id=layer_id,
-        #     prefix=add_prefix("attn", prefix),
-        # )
 
         self.alt_stream = alt_stream
 
+    def _apply_q_norm(self, q):
+        q_by_head = q.reshape(-1, self.head_dim)
+        q_by_head = self.query_layernorm(q_by_head)
+        return q_by_head.view(q.shape)
+    def _apply_k_norm(self, k):
+        k_by_head = k.reshape(-1, self.head_dim)
+        k_by_head = self.key_layernorm(k_by_head)
+        return k_by_head.view(k.shape)
+
+    @torch.compiler.disable(recursive=False)
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -810,20 +796,28 @@ class LLaDA2Attention(nn.Module):
         if self.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.query_layernorm(q_by_head)
+            q = self._apply_q_norm(q)
             with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.key_layernorm(k_by_head)
+                k = self._apply_k_norm(k)
             current_stream.wait_stream(self.alt_stream)
         else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.query_layernorm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.key_layernorm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
+            q = self._apply_q_norm(q)
+            k = self._apply_k_norm(k)
         return q, k
+
+    @torch.compiler.disable(recursive=False)
+    def _apply_repeat(self, k, v):
+        if self.alt_stream is not None and get_is_capture_mode():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            k = repeat_kv(k, self.num_key_value_groups)
+            with torch.cuda.stream(self.alt_stream):
+                v = repeat_kv(v, self.num_key_value_groups)
+            current_stream.wait_stream(self.alt_stream)   
+        else:
+            k = repeat_kv(k, self.num_key_value_groups)
+            v = repeat_kv(v, self.num_key_value_groups)
+        return k, v
 
     def forward(
         self,
@@ -869,22 +863,19 @@ class LLaDA2Attention(nn.Module):
             # k, v = past_key_values.update(k, v, self.layer_id, replace_position)
         if use_cache:
             present_key_values = (k, v)
-        
-        # print(3, q.shape, k.shape, v.shape)
-        
-        # q = q.transpose(1, 2)
-        # k = k.transpose(1, 2)
-        # v = v.transpose(1, 2)
-        k = repeat_kv(k, self.num_key_value_groups)
-        v = repeat_kv(v, self.num_key_value_groups)
 
-        # print(4, q.shape, k.shape, v.shape)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(q.dtype)
-        # print('attn:', q.shape, k.shape, v.shape, attention_mask.shape if attention_mask is not None else None)
+        k, v = self._apply_repeat(k, v)
+
         if attention_mask is not None:
             if len(attention_mask.shape)==3:
                 attention_mask = attention_mask.unsqueeze(1)
+        # This code is used to eliminate the impact of cache padding, but with vary cache length, the impact is 
+        # limited and has little drop in score. We leave it here for potential future use if there is accuracy issue
+        # key_padding_mask = (k.abs().sum(1, keepdim=True).sum(-1)>0.00001).unsqueeze(2).repeat(1, 1, q.shape[2], 1)
+        # if attention_mask is not None:
+        #     attention_mask = attention_mask & key_padding_mask
+        # else:
+        #     attention_mask = key_padding_mask
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -1309,18 +1300,39 @@ class LLaDA2SGLangLM(nn.Module):
             if key not in params_dict:
                 print(f"not match:{key}")
                 continue
+            if self.quant_config is not None:
+                # unsqueeze to match sglang params shape
+                if value.dim() == 0 and params_dict[key].dim() == 1:
+                    if params_dict[key].shape[0] == 1:
+                        # [] -> [1]
+                        value = value.unsqueeze(0)    
+                    elif params_dict[key].shape[0] == 2:
+                        # [] -> [1] -> [2]
+                        value = value.unsqueeze(0).repeat(2)    
+                    elif params_dict[key].shape[0] == 3:
+                        # [] -> [1] -> [2]
+                        value = value.unsqueeze(0).repeat(3)    
+                    weights[key] = value 
             if value.shape != params_dict[key].shape:
                 # print('shape mismatch:', key, value.shape, params_dict[key].shape)
-                if 'query_key_value.weight' not in key:
+                if not re.search(r'query_key_value.weight$', key):
                     mismatch_dim = 0 if value.shape[0] != params_dict[key].shape[0] else 1
                     if mismatch_dim==0:
                         part_size = params_dict[key].shape[0]
-                        weights[key] = value[tp_rank * part_size : (tp_rank + 1) * part_size]
+                        weights[key] = (
+                            value[tp_rank * part_size : (tp_rank + 1) * part_size] 
+                            if self.quant_config is None 
+                            else value[tp_rank * part_size : (tp_rank + 1) * part_size].contiguous()    # this fix stride issue
+                        )    
                     else:
                         part_size = params_dict[key].shape[1]
-                        weights[key] = value[:, tp_rank * part_size : (tp_rank + 1) * part_size]
-                    assert weights[key].shape == params_dict[key].shape
-                    # print('shape mismatch fixed:', key, weights[key].shape, params_dict[key].shape)
+                        weights[key] = (
+                            value[:, tp_rank * part_size : (tp_rank + 1) * part_size] 
+                            if self.quant_config is None 
+                            else value[:, tp_rank * part_size : (tp_rank + 1) * part_size].contiguous()     # this fix stride issue
+                        )  
+                    if weights[key].shape != params_dict[key].shape:
+                        print('shape mismatch fixed:', key, weights[key].shape, params_dict[key].shape)
                 else:
                     hidden_size = self.config.hidden_size
                     total_num_heads = self.config.num_attention_heads
@@ -1328,10 +1340,17 @@ class LLaDA2SGLangLM(nn.Module):
                     q_dim = hidden_size
                     q_part = q_dim // tp_size
                     q_weight = value[tp_rank * q_part : (tp_rank + 1) * q_part]
-                    kv_dim = hidden_size * total_kv_heads // total_num_heads
-                    kv_part = kv_dim // tp_size
-                    k_weight = value[q_dim + tp_rank * kv_part : q_dim + (tp_rank + 1) * kv_part]
-                    v_weight = value[q_dim + kv_dim + tp_rank * kv_part : q_dim + kv_dim + (tp_rank + 1) * kv_part]
+                    if tp_size > total_kv_heads:
+                        n_replica = tp_size//total_kv_heads
+                        kv_dim = hidden_size * total_kv_heads // total_num_heads
+                        kv_part = kv_dim // total_kv_heads
+                        k_weight = value[q_dim + (tp_rank//n_replica) * kv_part : q_dim + ((tp_rank//n_replica) + 1) * kv_part]
+                        v_weight = value[q_dim + kv_dim + (tp_rank//n_replica) * kv_part : q_dim + kv_dim + ((tp_rank//n_replica) + 1) * kv_part]
+                    else:
+                        kv_dim = hidden_size * total_kv_heads // total_num_heads
+                        kv_part = kv_dim // tp_size
+                        k_weight = value[q_dim + tp_rank * kv_part : q_dim + (tp_rank + 1) * kv_part]
+                        v_weight = value[q_dim + kv_dim + tp_rank * kv_part : q_dim + kv_dim + (tp_rank + 1) * kv_part]
                     weights[key] = torch.cat([q_weight, k_weight, v_weight], dim=0)
                     assert weights[key].shape == params_dict[key].shape
 
@@ -1360,74 +1379,182 @@ class LLaDA2SGLangLM(nn.Module):
                 and isinstance(layer.mlp, LLaDA2SparseMoeBlock)
             }
     
-    def load_state_dict(self, model_dir, strict=True, dtype=torch.bfloat16, device=None):
-        num_experts = self.config.num_experts
-        moe_intermediate_size = self.config.moe_intermediate_size
-        num_layers = self.config.num_hidden_layers
-        ep_rank = get_tensor_model_parallel_rank()
-        ep_size = get_tensor_model_parallel_world_size()
-        expert_start = ep_rank * num_experts // ep_size
-        expert_end = (ep_rank + 1) * num_experts // ep_size
-        index_path = Path(model_dir) / "model.safetensors.index.json"
-        with open(index_path, "r") as f:
-            index = json.load(f)
+    def _update_state_dict_for_fusemoe_quant(self, state_dict, num_layers, dtype, per_gpu_expert_mapping, per_gpu_inverse_mapping, device):
+        new_state_dict = {}
+        gate_projs = [{} for _ in range(num_layers)]
+        gate_input_scales = [{} for _ in range(num_layers)]
+        gate_weight_scales = [{} for _ in range(num_layers)]
+        up_projs = [{} for _ in range(num_layers)]
+        up_weight_scales = [{} for _ in range(num_layers)]
+        down_projs = [{} for _ in range(num_layers)]
+        down_input_scales = [{} for _ in range(num_layers)]
+        down_weight_scales = [{} for _ in range(num_layers)]
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        ep_rank = get_moe_expert_parallel_rank()
+        ep_size = get_moe_expert_parallel_world_size()
+        for key, value in tqdm.tqdm(state_dict.items()):
+            if ".mlp.experts." in key:
+                layer_id = int(key.split(".mlp.experts.")[0].split(".")[-1])
+                expert_id = int(key.split(".mlp.experts.")[1].split(".")[0])
+                
+                if layer_id < num_layers:
+                
+                    if re.search(r'experts\.\d{1,4}\.gate_proj\.input_scale',key):
+                        gate_input_scales[layer_id][expert_id] = value
+                    elif re.search(r'experts\.\d{1,4}\.gate_proj\.weight_scale',key):
+                        gate_weight_scales[layer_id][expert_id] = value
+                    elif re.search(r'experts\.\d{1,4}\.up_proj\.weight_scale',key):
+                        up_weight_scales[layer_id][expert_id] = value
+                    elif re.search(r'experts\.\d{1,4}\.down_proj\.input_scale',key):
+                        down_input_scales[layer_id][expert_id] = value
+                    elif re.search(r'experts\.\d{1,4}\.down_proj\.weight_scale',key):
+                        down_weight_scales[layer_id][expert_id] = value
 
-        weight_map = index["weight_map"]
-        shard_files = {v for v in weight_map.values()}
 
-        state_dict = {}
-        # print(shard_files)
-        ep_rank = get_tensor_model_parallel_rank()
-        ep_size = get_tensor_model_parallel_world_size()
-        if num_layers == 20:
-            # expert_map_path = Path(__file__).parent / ('mini_expert_map_'+str(ep_size)+'.pt')
-            expert_map_path = Path(self.expert_map_path+'/mini_expert_map_'+str(ep_size)+'.pt')
-        else:
-            # expert_map_path = Path(__file__).parent / ('flash_expert_map_'+str(ep_size)+'.pt')
-            expert_map_path = Path(self.expert_map_path+'/flash_expert_map_'+str(ep_size)+'.pt')
-        if expert_map_path.exists():
-            print("load expert_map from", expert_map_path)
-            expert_map = torch.load(expert_map_path)
-        else:
-            print('no expert_map found in', expert_map_path)
-            expert_map = torch.zeros(num_experts, dtype=torch.int32)  # expert_to_gpu[l, e] = gpu_id
-            for e in range(num_experts):
-                expert_map[e] = e // (num_experts//ep_size)
-            expert_map = expert_map.unsqueeze(0).repeat(num_layers, 1)
-        arange_256 = torch.arange(num_experts, dtype=torch.int64)
-        per_gpu_expert_mapping = [arange_256[expert_map[i]==ep_rank] for i in range(num_layers)]
-        # for layer_id in range(num_layers):
-        #     print("layer_id", layer_id, 'per_gpu_expert_mapping:', per_gpu_expert_mapping[layer_id])
-        per_gpu_inverse_mapping = [torch.ones(num_experts, dtype=torch.int64).mul(-1) for _ in range(num_layers)]
-        for layer_id in range(num_layers):
-            per_gpu_inverse_mapping[layer_id][per_gpu_expert_mapping[layer_id]] = torch.arange(per_gpu_expert_mapping[layer_id].shape[0])
-            # print("layer_id", layer_id, 'per_gpu_inverse_mapping:', per_gpu_inverse_mapping[layer_id])
-              
-        for shard in tqdm.tqdm(sorted(shard_files)):
-            shard_path = Path(model_dir) / shard
-            if not shard_path.exists():
-                raise FileNotFoundError(f"Missing shard: {shard_path}")
+                    elif re.search(r'experts\.\d{1,4}\.gate_proj\.weight$',key):
+                        gate_projs[layer_id][expert_id] = value
+                    elif re.search(r'experts\.\d{1,4}\.up_proj\.weight$',key):
+                        up_projs[layer_id][expert_id] = value
+                    elif re.search(r'experts\.\d{1,4}\.down_proj\.weight$',key):
+                        down_projs[layer_id][expert_id] = value
+            else:
+                new_state_dict[key] = value
+
+        for layer_id in tqdm.trange(num_layers):
+            w13_weight = []
+            w2_weight = []
+            w13_input_scale = []
+            w13_weight_scale = []
+            w2_input_scale = []
+            w2_weight_scale = []
+            if f"model.layers.{layer_id}.mlp.w1" in state_dict.keys():
+                ep_rank = get_tensor_model_parallel_rank()
+                ep_size = get_tensor_model_parallel_world_size()
+                size = divide(state_dict[f"model.layers.{layer_id}.mlp.w1"].shape[0], ep_size)
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_weight"] = state_dict[f"model.layers.{layer_id}.mlp.w1"][per_gpu_expert_mapping[layer_id]].contiguous()
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_weight"] = state_dict[f"model.layers.{layer_id}.mlp.w2"][per_gpu_expert_mapping[layer_id]].contiguous()
+                del new_state_dict[f"model.layers.{layer_id}.mlp.w1"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.w2"]
+                self.model.layers[layer_id].mlp.experts.expert_map_cpu = per_gpu_inverse_mapping[layer_id]
+                
+            # if 0 in gate_projs[layer_id].keys():
+            if len(gate_projs[layer_id]) > 0:
+                for expert_id in per_gpu_expert_mapping[layer_id]:
+                    expert_id = int(expert_id)
+                    gate_proj = gate_projs[layer_id][expert_id].to(device)
+                    up_proj = up_projs[layer_id][expert_id].to(device)
+                    down_proj = down_projs[layer_id][expert_id].to(device)
+                    gate_weight_scale = gate_weight_scales[layer_id][expert_id].to(device)
+                    up_weight_scale = up_weight_scales[layer_id][expert_id].to(device)
+                    down_weight_scale = down_weight_scales[layer_id][expert_id].to(device)
+                    gate_input_scale = gate_input_scales[layer_id][expert_id].to(device)
+                    down_input_scale = down_input_scales[layer_id][expert_id].to(device)
+
+                    w13_weight.append(torch.cat([gate_proj, up_proj], dim=0))
+                    w2_weight.append(down_proj)
+
+                    w13_input_scale.append(gate_input_scale)
+                    w13_weight_scale.append(torch.stack([gate_weight_scale, up_weight_scale], dim=0))
+                    w2_input_scale.append(down_input_scale)
+                    w2_weight_scale.append(down_weight_scale)
+
+                w13_weight = torch.stack(w13_weight, dim=0)
+                w2_weight = torch.stack(w2_weight, dim=0)
+                w13_input_scale = torch.stack(w13_input_scale, dim=0)
+                w13_weight_scale = torch.stack(w13_weight_scale, dim=0)
+                w2_input_scale = torch.stack(w2_input_scale, dim=0)
+                w2_weight_scale = torch.stack(w2_weight_scale, dim=0)
+
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_weight"] = w13_weight.contiguous()
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_weight"] = w2_weight.contiguous()
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_input_scale"] = w13_input_scale.contiguous()
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_weight_scale"] = w13_weight_scale.contiguous()
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_input_scale"] = w2_input_scale.contiguous()
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_weight_scale"] = w2_weight_scale.contiguous()
+                    
+                self.model.layers[layer_id].mlp.experts.expert_map_cpu = per_gpu_inverse_mapping[layer_id]
             
-            with torch.inference_mode():
-                file_state_dict = load_file(str(shard_path))
-                filtered_file_state_dict = {}
-                for key, value in file_state_dict.items():
-                    if ".mlp.experts." in key:
-                        layer_id = int(key.split(".mlp.experts.")[0].split(".")[-1])
-                        expert_id = int(key.split(".mlp.experts.")[1].split(".")[0])
-                        if expert_map[layer_id][expert_id] == ep_rank:
-                        # if expert_start <= expert_id < expert_end:
-                            filtered_file_state_dict[key] = value
-                    else:
-                        filtered_file_state_dict[key] = value
-                        
-                state_dict.update(file_state_dict)
+            if f"model.layers.{layer_id}.mlp.gate.expert_bias" in state_dict.keys():
+                new_state_dict[f"model.layers.{layer_id}.mlp.correction_bias"] = state_dict[f"model.layers.{layer_id}.mlp.gate.expert_bias"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.gate.expert_bias"]
 
-        tp_rank, tp_size = ep_rank, ep_size
+            if f"model.layers.{layer_id}.mlp.shared_experts.gate_proj.weight" in state_dict.keys():
+                part_size = state_dict[f"model.layers.{layer_id}.mlp.shared_experts.gate_proj.weight"].shape[0] // tp_size
+                part_start = tp_rank * part_size
+                part_end = (tp_rank + 1) * part_size
+                
+                new_state_dict[f"model.layers.{layer_id}.mlp.shared_experts.gate_up_proj.weight"] = torch.cat(
+                    [state_dict[f"model.layers.{layer_id}.mlp.shared_experts.gate_proj.weight"][part_start:part_end], 
+                    state_dict[f"model.layers.{layer_id}.mlp.shared_experts.up_proj.weight"][part_start:part_end]], dim=0)
+                new_state_dict[f"model.layers.{layer_id}.mlp.shared_experts.gate_up_proj.weight_scale"] = torch.stack(
+                    [state_dict[f"model.layers.{layer_id}.mlp.shared_experts.gate_proj.weight_scale"], 
+                    state_dict[f"model.layers.{layer_id}.mlp.shared_experts.up_proj.weight_scale"]], dim=0)
+                new_state_dict[f"model.layers.{layer_id}.mlp.shared_experts.gate_up_proj.input_scale"] = torch.stack(
+                    [state_dict[f"model.layers.{layer_id}.mlp.shared_experts.gate_proj.input_scale"], 
+                    state_dict[f"model.layers.{layer_id}.mlp.shared_experts.up_proj.input_scale"]], dim=0)
+                del new_state_dict[f"model.layers.{layer_id}.mlp.shared_experts.gate_proj.weight"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.shared_experts.up_proj.weight"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.shared_experts.gate_proj.weight_scale"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.shared_experts.up_proj.weight_scale"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.shared_experts.gate_proj.input_scale"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.shared_experts.up_proj.input_scale"]
+
+            if f"model.layers.{layer_id}.mlp.gate_proj.weight" in state_dict.keys():
+                part_size = state_dict[f"model.layers.{layer_id}.mlp.gate_proj.weight"].shape[0] // tp_size
+                part_start = tp_rank * part_size
+                part_end = (tp_rank + 1) * part_size
+                new_state_dict[f"model.layers.{layer_id}.mlp.gate_up_proj.weight"] = torch.cat(
+                    [state_dict[f"model.layers.{layer_id}.mlp.gate_proj.weight"][part_start:part_end], 
+                    state_dict[f"model.layers.{layer_id}.mlp.up_proj.weight"][part_start:part_end]], dim=0)
+                new_state_dict[f"model.layers.{layer_id}.mlp.gate_up_proj.weight_scale"] = torch.stack(
+                    [state_dict[f"model.layers.{layer_id}.mlp.gate_proj.weight_scale"], 
+                    state_dict[f"model.layers.{layer_id}.mlp.up_proj.weight_scale"]], dim=0)
+                new_state_dict[f"model.layers.{layer_id}.mlp.gate_up_proj.input_scale"] = torch.stack(
+                    [state_dict[f"model.layers.{layer_id}.mlp.gate_proj.input_scale"], 
+                    state_dict[f"model.layers.{layer_id}.mlp.up_proj.input_scale"]], dim=0)
+                del new_state_dict[f"model.layers.{layer_id}.mlp.gate_proj.weight"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.up_proj.weight"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.gate_proj.weight_scale"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.up_proj.weight_scale"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.gate_proj.input_scale"]
+                del new_state_dict[f"model.layers.{layer_id}.mlp.up_proj.input_scale"]
+
+        new_state_dict['model.full_word_embeddings.weight'] = state_dict['model.word_embeddings.weight']
+        
+        for key, value in tqdm.tqdm(new_state_dict.items()):
+            new_state_dict[key] = value.to(device)
+        self.apply_state_dicts(new_state_dict)
+        for name, param in self.named_parameters():
+
+            if 'norm' in name:
+                param.data = param.data.to(dtype)
+            elif 'embed_tokens' in name:
+                param.data = param.data.to(dtype)
+            elif 'lm_head' in name:
+                param.data = param.data.to(dtype)
+            elif '.mlp.correction_bias' in name :
+                param.data = param.data.to(torch.float32)
+            else:
+                continue
+
+        for name, buf in self.named_buffers():
+            if "scale" in name:
+                continue
+            if buf.dtype != dtype:
+                buf.data = buf.data.to(dtype)
+
+
+    def _update_state_dict_for_fusemoe(self, state_dict, num_layers, dtype, per_gpu_expert_mapping, per_gpu_inverse_mapping, device):
         new_state_dict = {}
         gate_projs = [{} for _ in range(num_layers)]
         up_projs = [{} for _ in range(num_layers)]
         down_projs = [{} for _ in range(num_layers)]
+
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        moe_tp_rank = get_moe_tensor_parallel_rank()
+        moe_tp_size = get_moe_tensor_parallel_world_size()
         for key, value in tqdm.tqdm(state_dict.items()):
             if ".mlp.experts." in key:
                 layer_id = int(key.split(".mlp.experts.")[0].split(".")[-1])
@@ -1447,11 +1574,8 @@ class LLaDA2SGLangLM(nn.Module):
             w13_weight = []
             w2_weight = []
             if f"model.layers.{layer_id}.mlp.w1" in state_dict.keys():
-                ep_rank = get_tensor_model_parallel_rank()
-                ep_size = get_tensor_model_parallel_world_size()
-                size = divide(state_dict[f"model.layers.{layer_id}.mlp.w1"].shape[0], ep_size)
-                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_weight"] = state_dict[f"model.layers.{layer_id}.mlp.w1"][per_gpu_expert_mapping[layer_id]].contiguous()
-                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_weight"] = state_dict[f"model.layers.{layer_id}.mlp.w2"][per_gpu_expert_mapping[layer_id]].contiguous()
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_weight"] = self._tp_split(state_dict[f"model.layers.{layer_id}.mlp.w1"][per_gpu_expert_mapping[layer_id]], dim=1, rank=moe_tp_rank, world=moe_tp_size, is_w13=True).contiguous()
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_weight"] = self._tp_split(state_dict[f"model.layers.{layer_id}.mlp.w2"][per_gpu_expert_mapping[layer_id]], dim=2, rank=moe_tp_rank, world=moe_tp_size).contiguous()
                 del new_state_dict[f"model.layers.{layer_id}.mlp.w1"]
                 del new_state_dict[f"model.layers.{layer_id}.mlp.w2"]
                 self.model.layers[layer_id].mlp.experts.expert_map_cpu = per_gpu_inverse_mapping[layer_id]
@@ -1464,13 +1588,12 @@ class LLaDA2SGLangLM(nn.Module):
                     down_proj = down_projs[layer_id][expert_id].to(device)
                     w13_weight.append(torch.cat([gate_proj, up_proj], dim=0))
                     w2_weight.append(down_proj)
-                w13_weight = torch.stack(w13_weight, dim=0)
-                w2_weight = torch.stack(w2_weight, dim=0)
+                w13_weight = self._tp_split(torch.stack(w13_weight, dim=0), dim=1, rank=moe_tp_rank, world=moe_tp_size, is_w13=True)
+                w2_weight = self._tp_split(torch.stack(w2_weight, dim=0), dim=2, rank=moe_tp_rank, world=moe_tp_size)
 
                 new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_weight"] = w13_weight.contiguous()
                 new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_weight"] = w2_weight.contiguous()
                 self.model.layers[layer_id].mlp.experts.expert_map_cpu = per_gpu_inverse_mapping[layer_id]
-                # new_state_dict[f"model.layers.{layer_id}.mlp.experts.expert_map"] = per_gpu_expert_mapping[layer_id]
             if f"model.layers.{layer_id}.mlp.gate.expert_bias" in state_dict.keys():
                 new_state_dict[f"model.layers.{layer_id}.mlp.correction_bias"] = state_dict[f"model.layers.{layer_id}.mlp.gate.expert_bias"]
                 del new_state_dict[f"model.layers.{layer_id}.mlp.gate.expert_bias"]
@@ -1493,14 +1616,88 @@ class LLaDA2SGLangLM(nn.Module):
         new_state_dict['model.full_word_embeddings.weight'] = state_dict['model.word_embeddings.weight']
         for key, value in tqdm.tqdm(new_state_dict.items()):
             new_state_dict[key] = value.to(device)
-
-
         self.apply_state_dicts(new_state_dict)
         for name, param in self.named_parameters():
             if '.mlp.correction_bias' in name or 'layernorm.weight' in name:
                 param.data = param.data.to(torch.float32)
             else:
                 param.data = param.data.to(dtype)
+
+    def _tp_split(self, tensor: torch.Tensor, dim: int, rank: int, world: int, is_w13=False):
+        """把 tensor 按 dim 切成 world 份，返回 rank 对应的那份"""
+        if world == 1:
+            return tensor
+        if is_w13:
+            shard_size = tensor.size(dim) // 2
+            size = shard_size // world
+            w1 = tensor.narrow(dim, rank * size, size)
+            w3 = tensor.narrow(dim, shard_size + rank * size, size)
+            return torch.cat([w1, w3], dim=dim)
+        else:
+            size = tensor.size(dim) // world
+            return tensor.narrow(dim, rank * size, size)
+
+    def load_state_dict(self, model_dir, strict=True, dtype=torch.bfloat16, device=None):
+        num_experts = self.config.num_experts
+        moe_intermediate_size = self.config.moe_intermediate_size
+        num_layers = self.config.num_hidden_layers
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        ep_rank = get_moe_expert_parallel_rank()
+        ep_size = get_moe_expert_parallel_world_size()
+
+        index_path = Path(model_dir) / "model.safetensors.index.json"
+        with open(index_path, "r") as f:
+            index = json.load(f)
+
+        weight_map = index["weight_map"]
+        shard_files = {v for v in weight_map.values()}
+
+        state_dict = {}
+        if num_layers == 20:
+            expert_map_path = Path(self.expert_map_path+'/mini_expert_map_'+str(ep_size)+'.pt')
+        else:
+            expert_map_path = Path(self.expert_map_path+'/flash_expert_map_'+str(ep_size)+'.pt')
+        if expert_map_path.exists():
+            print("load expert_map from", expert_map_path)
+            expert_map = torch.load(expert_map_path)
+        else:
+            print('no expert_map found in', expert_map_path)
+            expert_map = torch.zeros(num_experts, dtype=torch.int32)  # expert_to_gpu[l, e] = gpu_id
+            for e in range(num_experts):
+                expert_map[e] = e // (num_experts//ep_size)
+            expert_map = expert_map.unsqueeze(0).repeat(num_layers, 1)
+        arange_256 = torch.arange(num_experts, dtype=torch.int64)
+        per_gpu_expert_mapping = [arange_256[expert_map[i]==ep_rank] for i in range(num_layers)]
+        per_gpu_inverse_mapping = [torch.ones(num_experts, dtype=torch.int64).mul(-1) for _ in range(num_layers)]
+        for layer_id in range(num_layers):
+            per_gpu_inverse_mapping[layer_id][per_gpu_expert_mapping[layer_id]] = torch.arange(per_gpu_expert_mapping[layer_id].shape[0])
+              
+        for shard in tqdm.tqdm(sorted(shard_files)):
+            shard_path = Path(model_dir) / shard
+            if not shard_path.exists():
+                raise FileNotFoundError(f"Missing shard: {shard_path}")
+            
+            with torch.inference_mode():
+                file_state_dict = load_file(str(shard_path))
+                filtered_file_state_dict = {}
+                for key, value in file_state_dict.items():
+                    if ".mlp.experts." in key:
+                        layer_id = int(key.split(".mlp.experts.")[0].split(".")[-1])
+                        expert_id = int(key.split(".mlp.experts.")[1].split(".")[0])
+                        if expert_map[layer_id][expert_id] == ep_rank:
+                            filtered_file_state_dict[key] = value
+                    else:
+                        filtered_file_state_dict[key] = value
+                        
+                state_dict.update(file_state_dict)
+
+        if self.quant_config is not None:
+            self._update_state_dict_for_fusemoe_quant(state_dict, num_layers, dtype, per_gpu_expert_mapping, per_gpu_inverse_mapping, device)
+        else:
+            self._update_state_dict_for_fusemoe(state_dict, num_layers, dtype, per_gpu_expert_mapping, per_gpu_inverse_mapping, device)
+
+
 
     def init_h2e_module(self):
         self.h2e = H2Embed(self.model.full_word_embeddings, tau=1.0)
@@ -1520,6 +1717,21 @@ class LLaDA2SGLangLM(nn.Module):
             num_logical_experts=config.num_experts,
             num_groups=None if num_groups == 0 else num_groups,
         )
-
+    def after_loading(self):
+        for name, module in self.named_modules():
+            if hasattr(module, "quant_method") and module.quant_method is not None and hasattr(module.quant_method, "process_weights_after_loading"):
+                if hasattr(module, "weight_scale") and module.weight_scale is not None:
+                    if module.weight_scale.dim() == 0:
+                        print(f"Fixing scalar weight_scale for {name}")
+                        module.weight_scale.data = module.weight_scale.data.unsqueeze(0)
+                if hasattr(module, "input_scale") and module.input_scale is not None:
+                    if module.input_scale.dim() == 0:
+                        print(f"Fixing scalar input_scale for {name}")
+                        module.input_scale.data = module.input_scale.data.unsqueeze_(0)
+                module.quant_method.process_weights_after_loading(module)
+    
+    def after_processing(self):
+        if self.quant_config is not None:
+            self.after_loading()
 
 EntryClass = [LLaDA2SGLangLM]

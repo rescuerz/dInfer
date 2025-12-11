@@ -11,6 +11,7 @@ import random
 
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from dinfer.model.modeling_llada2_moe_sglang import LLaDA2SGLangLM
 from dinfer.decoding.diffusion_runner import ModelRunner
 from dinfer import BlockIteratorFactory, KVCacheFactory, BlockDiffusionLLM
@@ -19,13 +20,6 @@ from dinfer import ThresholdParallelDecoder,CreditThresholdParallelDecoder, Hier
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
-
-
-def setup_distributed(rank, world_size):
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
-    os.environ['MASTER_PORT'] = '12345'
-    print(f'rank={rank}, world size={world_size}')
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 bucket_size = 32
 used_buckets = []
@@ -81,6 +75,21 @@ def cut_eos(data, eos_id=156892):
     else:
         return data
 
+def load_quant_config(config, path):
+    """
+    read hf_quant_config.json from model path
+    if exist, set attribute config.quant_config
+    else, treat as a non-quantized model
+    """
+    quant_config_path = os.path.join(path, "hf_quant_config.json")
+    if os.path.exists(quant_config_path):
+        with open(quant_config_path, "r") as f:
+            quant_config_json = json.load(f)
+        quant_config = ModelOptFp8Config.from_config(quant_config_json)
+        setattr(config, "quant_config", quant_config)
+    else:
+        print(f"[Info] {quant_config_path} not found. Treating as a non-quantized model.")
+
 @ torch.no_grad()
 def main(world_size, rank, gpu_id, args):
     print('started', world_size, rank, gpu_id, args)
@@ -99,12 +108,16 @@ def main(world_size, rank, gpu_id, args):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = args.port
     distributed.init_distributed_environment(world_size, rank, 'env://', rank, 'nccl')
-    distributed.initialize_model_parallel(args.tp_size, args.tp_size, 1, backend='nccl')
+    distributed.initialize_model_parallel(args.tp_size, args.ep_size, 1, backend='nccl')
     print("[Loading model]")
 
     from sglang.srt.layers.dp_attention import initialize_dp_attention
     model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
-    server_args = ServerArgs(model_path=args.model_name, enable_dp_attention=True, trust_remote_code=True, tp_size=args.tp_size, dp_size = 1, pp_size = 1)
+    if args.use_quant:
+        load_quant_config(model_config, args.model_name)
+        server_args = ServerArgs(model_path=args.model_name, quantization="modelopt_fp8",modelopt_quant="fp8", enable_dp_attention=True, trust_remote_code=True, tp_size=args.tp_size, dp_size = 1, pp_size = 1)
+    else:
+        server_args = ServerArgs(model_path=args.model_name, enable_dp_attention=True, trust_remote_code=True, tp_size=args.tp_size, dp_size = 1, pp_size = 1)
     try:
         from sglang.srt.server_args import set_global_server_args_for_scheduler
     except ImportError:
@@ -116,16 +129,22 @@ def main(world_size, rank, gpu_id, args):
         model_config=model_config,
     )
     initialize_moe_config(server_args)
-    model = LLaDA2SGLangLM(config=model_config, expert_map_path='.').eval()
+    if args.use_quant:
+        model = LLaDA2SGLangLM(config=model_config, quant_config = model_config.quant_config, expert_map_path='.').eval()
+    else:
+        model = LLaDA2SGLangLM(config=model_config, expert_map_path='.').eval()
     torch.set_default_dtype(torch.bfloat16)
     model.load_weights(args.model_name, device=device)
     initialize_moe_config(server_args)
     
     
     model = model.to(device)
+    model.after_processing()    # if model is quantized, use quant_method.process_weights_after_loading
     input_lengths = [inp.size(-1) for inp in all_input_ids]
     max_length = max(input_lengths)+args.gen_len
-    model = ModelRunner(model, device, server_args=server_args, max_length=max_length)
+    aligned_lengths = np.unique([length//args.block_length*args.block_length for length in input_lengths])
+    aligned_lengths = [int(length) for length in aligned_lengths]
+    model = ModelRunner(model, device, server_args=server_args, max_length=max_length, prefill_lengths=aligned_lengths, enable_cuda_graph=True, supported_batch_sizes=[args.batch_size])
 
 
     if args.parallel_decoding == 'threshold':
@@ -156,8 +175,10 @@ def main(world_size, rank, gpu_id, args):
             else:
                 dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=args.use_shift)
     else:
-        dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=cache_factory, early_stop=True, maximum_unroll=4, expected_tpf=4, backend='sglang')
-
+        dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=cache_factory, early_stop=True, maximum_unroll=1, expected_tpf=15, backend='sglang')
+    # warmup for decoding algorithms
+    input_ids = torch.arange(64, dtype=torch.long, device=device).unsqueeze(0)
+    dllm.generate(input_ids, gen_length=args.gen_len, block_length=args.block_length)
     batch_size = args.batch_size
     
 
@@ -294,6 +315,8 @@ if __name__ == '__main__':
     parser.add_argument('--use_shift', action='store_true')
     parser.add_argument('--use_bd', action='store_true')
     parser.add_argument('--model_type', type=str, default='mini')
+    parser.add_argument('--ep_size', type=int, default=1)
+    parser.add_argument('--use_quant' ,action='store_true')
     parser.add_argument('--config', type=int, default=0)
     args = parser.parse_args()
     port = random.randint(40000, 60000)
