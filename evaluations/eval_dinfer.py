@@ -676,7 +676,7 @@ class DInferEvalHarness(LM):
         elif self.parallel == 'tp':
             procs = []
             answers = []
-            gpus = [int(gpu) for gpu in self.gpus.split(',')]
+            gpus = [int(gpu) for gpu in self.gpus.split(';')]
             args = {"gpu": self.gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift}
             args = EvalConfig(**args)
             args.tp_size = len(gpus)

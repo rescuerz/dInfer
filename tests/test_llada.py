@@ -28,7 +28,6 @@ from test_generate import IterSmoothDiffusionLLM as IterSmoothDiffusionLLM_test
 from test_generate import IterSmoothWithVicinityCacheDiffusionLLM as IterSmoothWithVicinityCacheDiffusionLLM_test
 
 model_path = "/mnt/infra/myx/models/LLaDA-1.5/"
-# model_path = "/data/myx/llm/vllm/model/LLaDA-1_5/"
 
 def get_prompts(tokenizer, mask_id, device, num=1):
     prompt = "Lily can run 12 kilometers per hour for 4 hours. After that, she can run 6 kilometers per hour. How many kilometers can she run in 8 hours? "
@@ -87,17 +86,18 @@ class SimulateBlockIteratorFactory:
 
 torch.cuda.set_device(0)
 device = torch.device(0)
-config = AutoConfig.from_pretrained(model_path)
+config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
 config.flash_attention = True
+config.train_max_sequence_length = 4096
 model = LLaDAModelLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, config=config).eval()
 model = model.to(device)
 fastdllm_model = LLaDAModelLM_fastdllm.from_pretrained(model_path, torch_dtype=torch.bfloat16, config=config).eval()
 fastdllm_model = fastdllm_model.to(device)
 decoder = ThresholdParallelDecoder(0, threshold=0.9, use_float64=True)
-tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
 input_ids = get_prompts(tokenizer, mask_id=126336, device=device)
 batch_size = 1
-input_ids = torch.tensor(input_ids).to(device).repeat(batch_size, 1)
+input_ids = input_ids.clone().detach().to(device).repeat(batch_size, 1)
 
 
 def test_sw_dual_cache():

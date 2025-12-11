@@ -10,6 +10,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from vllm.config import CompilationConfig, ParallelConfig
 from vllm.config import VllmConfig, set_current_vllm_config, get_current_vllm_config
+from vllm.forward_context import set_forward_context
 
 from dinfer.model import LLaDAMoeModelLM, LLaDAModelLM
 from dinfer import BlockWiseDiffusionLLM, VicinityCacheDiffusionLLM, IterSmoothDiffusionLLM, IterSmoothWithVicinityCacheDiffusionLLM, BlockWiseDiffusionLLMWithSP
@@ -29,7 +30,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 from test_generate import IterSmoothDiffusionLLM as IterSmoothDiffusionLLM_test
 from test_generate import IterSmoothWithVicinityCacheDiffusionLLM as IterSmoothWithVicinityCacheDiffusionLLM_test
 
-moe_model_path = '/mnt/dllm/fengling/moe/workdir/7bA1b_anneal_15t_0827_500B_further_8k_enneal_train_4k_ep3_v7_1e-5/step45567_converted_hf_fusemoe'
+moe_model_path = '/mnt/infra/dulun.dl/models/LLaDA-MoE/fusemoe/step45567_converted_hf_fusemoe'
 # moe_model_path = '/data/dulun/models/llada-moe-sft/llada-moe-sft-model/7bA1b_anneal_19t_500B_further_8k_anneal_train_4k_ep3_v8p5/step45567_converted_hf_fusemoe/'
 
 def get_prompts(tokenizer, mask_id, device, num=1):
@@ -57,7 +58,7 @@ gpu_id = 1
 device = torch.device(gpu_id)
 decoder = ThresholdParallelDecoder(0, threshold=0.9, mask_id=156895, eos_id=156892, use_float64=True)
 h_decoder = HierarchyDecoder(0, threshold=0.9, mask_id=156895, eos_id=156892, low_threshold=0.4)
-tokenizer = AutoTokenizer.from_pretrained(moe_model_path, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(moe_model_path, trust_remote_code=True, local_files_only=True)
 input_ids = get_prompts(tokenizer, mask_id=156895, device=device)
 model = None
 
@@ -73,7 +74,7 @@ def init_vllm_dist(worker_id):
   # setup EP
   parallel_config = ParallelConfig(enable_expert_parallel = True)
   with set_current_vllm_config(VllmConfig(parallel_config = parallel_config)):
-      model_config = AutoConfig.from_pretrained(moe_model_path, trust_remote_code=True)
+      model_config = AutoConfig.from_pretrained(moe_model_path, trust_remote_code=True, local_files_only=True)
       global model
       model = LLaDAMoeModelLM(config=model_config).eval()
       model.load_weights(moe_model_path, torch_dtype=torch.bfloat16)
@@ -88,8 +89,10 @@ def test_llada_moe_hierarchy():
   # Test block-wise hierarchical diffusion MOE-LLM without KV-cache
   print('Test block-wise hierarchical diffusion MOE-LLM without KV-cache')
   dllm = BlockWiseDiffusionLLM(model, h_decoder, BlockIteratorFactory(), early_stop=True)
-  res = dllm.generate(input_ids, gen_length=128, block_length=32)
-  res1, nfe = generate_hierarchy(model, input_ids, gen_length=128, block_length=32, threshold=0.9, mask_id=156895, eos_id=156892,decoding='hierarchy_fast_v2',
+  vllm_config = get_current_vllm_config()
+  with set_forward_context(None, vllm_config):
+    res = dllm.generate(input_ids, gen_length=128, block_length=32)
+    res1, nfe = generate_hierarchy(model, input_ids, gen_length=128, block_length=32, threshold=0.9, mask_id=156895, eos_id=156892,decoding='hierarchy_fast_v2',
                                         low_threshold=0.4, remask_threshold=0.4)
   res1 = res1[res1 != 156892]
   assert res.shape[1] == len(res1)
@@ -101,9 +104,11 @@ def test_llada_moe_blockwise():
   # Test generation without cache.
   print('Test block-wise diffusion MOE-LLM without KV-cache')
   dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(), early_stop=True)
-  res = dllm.generate(input_ids, gen_length=128, block_length=32)
-  res1, nfe = generate(model, input_ids, gen_length=128, block_length=32, threshold=0.9, mask_id=156895, eos_id=156892)
-  res2, nfe = generate_merge(model, input_ids, None, gen_length=128, block_length=32, threshold=0.9, mask_id=156895, eos_id=156892, parallel_decoding='threshold', early_stop=False,)
+  vllm_config = get_current_vllm_config()
+  with set_forward_context(None, vllm_config):
+    res = dllm.generate(input_ids, gen_length=128, block_length=32)
+    res1, nfe = generate(model, input_ids, gen_length=128, block_length=32, threshold=0.9, mask_id=156895, eos_id=156892)
+    res2, nfe = generate_merge(model, input_ids, None, gen_length=128, block_length=32, threshold=0.9, mask_id=156895, eos_id=156892, parallel_decoding='threshold', early_stop=False,)
   res1 = res1[res1 != 156892]
   res2 = res2[res2 != 156892]
   assert res.shape[1] == len(res1)
@@ -119,7 +124,9 @@ def test_llada_moe_batching():
   dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(), early_stop=True)
   print('Test block-wise diffusion MOE-LLM without KV-cache and batch size == 2')
   input_ids2 = get_prompts(tokenizer, mask_id=156895, device=device, num=2)
-  res2 = dllm.generate(input_ids2, gen_length=128, block_length=32)
+  vllm_config = get_current_vllm_config()
+  with set_forward_context(None, vllm_config):
+    res2 = dllm.generate(input_ids2, gen_length=128, block_length=32)
   assert res2.shape[0] == 2
 
 def test_llada_moe_itersmooth():
@@ -127,8 +134,10 @@ def test_llada_moe_itersmooth():
   print('Test block-wise diffusion MOE-LLM with iteration smooth without kv-cache')
   dllm = IterSmoothDiffusionLLM(model, decoder, BlockIteratorFactory(), early_stop=True)
   dllm1 = IterSmoothDiffusionLLM_test(model, decoder, BlockIteratorFactory(), early_stop=True)
-  res = dllm.generate(input_ids, gen_length=128, block_length=32)
-  res1 = dllm1.generate(input_ids, gen_length=128, block_length=32)
+  vllm_config = get_current_vllm_config()
+  with set_forward_context(None, vllm_config):
+    res = dllm.generate(input_ids, gen_length=128, block_length=32)
+    res1 = dllm1.generate(input_ids, gen_length=128, block_length=32)
   assert dllm.num_forwards == dllm1.num_forwards
   assert dllm.cache_updates == 0
   assert res.shape[1] == res1.shape[1]
@@ -139,8 +148,10 @@ def test_llada_moe_dual_cache():
   # Test generation with dual cache
   print('Test block-wise diffusion MOE-LLM with dual KV-cache')
   dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(), early_stop=True, cache_factory=KVCacheFactory('dual'))
-  res = dllm.generate(input_ids, gen_length=256, block_length=32)
-  res1, nfe = generate_with_dual_cache(model, input_ids, gen_length=256, block_length=32, threshold=0.9, mask_id=156895, eos_id=156892)
+  vllm_config = get_current_vllm_config()
+  with set_forward_context(None, vllm_config):
+    res = dllm.generate(input_ids, gen_length=256, block_length=32)
+    res1, nfe = generate_with_dual_cache(model, input_ids, gen_length=256, block_length=32, threshold=0.9, mask_id=156895, eos_id=156892)
   res1 = res1[res1 != 156892]
   assert res.shape[1] == len(res1)
   res1 = res1.to(res.device)
@@ -151,7 +162,9 @@ def test_llada_moe_dual_cache_batching():
   print('Test block-wise diffusion MOE-LLM with dual KV-cache and batch size == 2')
   dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(), early_stop=True, cache_factory=KVCacheFactory('dual'))
   input_ids2 = get_prompts(tokenizer, mask_id=156895, device=device, num=2)
-  res2 = dllm.generate(input_ids2, gen_length=256, block_length=32)
+  vllm_config = get_current_vllm_config()
+  with set_forward_context(None, vllm_config):
+    res2 = dllm.generate(input_ids2, gen_length=256, block_length=32)
   assert res2.shape[0] == 2
 
 def test_llada_moe_itersmooth_cache():
@@ -159,8 +172,10 @@ def test_llada_moe_itersmooth_cache():
   print('Test block-wise diffusion MOE-LLM with iteration smooth with kv-cache')
   dllm = IterSmoothDiffusionLLM(model, decoder, BlockIteratorFactory(), early_stop=True, cache_factory=KVCacheFactory('dual'))
   dllm1 = IterSmoothDiffusionLLM_test(model, decoder, BlockIteratorFactory(), early_stop=True, cache_factory=KVCacheFactory('dual'))
-  res = dllm.generate(input_ids, gen_length=128, block_length=32)
-  res1 = dllm1.generate(input_ids, gen_length=128, block_length=32)
+  vllm_config = get_current_vllm_config()
+  with set_forward_context(None, vllm_config):
+    res = dllm.generate(input_ids, gen_length=128, block_length=32)
+    res1 = dllm1.generate(input_ids, gen_length=128, block_length=32)
   assert dllm.num_forwards == dllm1.num_forwards
   assert dllm.cache_updates > 0
   assert dllm.cache_updates == dllm1.cache_updates
@@ -173,8 +188,10 @@ def test_llada_moe_itersmooth_vicinity_cache():
   print('Test block-wise diffusion MOE-LLM with iteration smooth with vicinity cache update')
   dllm = IterSmoothWithVicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(), early_stop=True, cache_factory=KVCacheFactory('dual'))
   dllm1 = IterSmoothWithVicinityCacheDiffusionLLM_test(model, decoder, BlockIteratorFactory(), early_stop=True, cache_factory=KVCacheFactory('dual'))
-  res = dllm.generate(input_ids, gen_length=128, block_length=32)
-  res1 = dllm1.generate(input_ids, gen_length=128, block_length=32)
+  vllm_config = get_current_vllm_config()
+  with set_forward_context(None, vllm_config):
+    res = dllm.generate(input_ids, gen_length=128, block_length=32)
+    res1 = dllm1.generate(input_ids, gen_length=128, block_length=32)
   assert dllm.num_forwards == dllm1.num_forwards
   assert dllm.cache_updates > 0
   assert dllm.cache_updates == dllm1.cache_updates

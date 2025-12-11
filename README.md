@@ -37,7 +37,9 @@ dInfer supports multiple dLLM variants, including LLaDA and LLaDA-MoE.
 - Loop unrolling mechanism to eliminate CUDA stream bubbles across diffusion iterations
 
 ## News
-**\[2025/11/15\]** Support the inference on block diffusion LLMs (LLaDA2-mini and LLaDA2-flash).
+**\[2025/12/10\]** Support and speed up the formal version of block diffusion LLMs (LLaDA2-mini and LLaDA2-flash). Support quant versions of LLaDA2-mini and LLaDA2-flash.
+
+**\[2025/11/15\]** Support the inference on block diffusion LLMs (LLaDA2-mini-preview and LLaDA2-flash-preview).
 
 **\[2025/10/10\]** Release the first version of the dInfer framework.
 
@@ -52,6 +54,8 @@ dInfer supports multiple diffusion language model variants with different archit
 
 | Model | Size | Implementation | HuggingFace Link |
 |-------|------|----------------|------------------|
+| LLaDA2.0-mini | 16B | [LLaDA2MoeModelLM](python/dinfer/model/modeling_llada2_moe.py) | [inclusionAI/LLaDA2.0-mini](https://huggingface.co/inclusionAI/LLaDA2.0-mini) |
+| LLaDA2.0-flash | 100B | [LLaDA2MoeModelLM](python/dinfer/model/modeling_llada2_moe.py) | [inclusionAI/LLaDA2.0-flash](https://huggingface.co/inclusionAI/LLaDA2.0-flash) |
 | LLaDA2.0-mini-preview | 16B | [LLaDA2MoeModelLM](python/dinfer/model/modeling_llada2_moe.py) | [inclusionAI/LLaDA2.0-mini-preview](https://huggingface.co/inclusionAI/LLaDA2.0-mini-preview) |
 | LLaDA2.0-flash-preview | 100B | [LLaDA2MoeModelLM](python/dinfer/model/modeling_llada2_moe.py) | [inclusionAI/LLaDA2.0-flash-preview](https://huggingface.co/inclusionAI/LLaDA2.0-flash-preview) |
 | LLaDA-MoE-7B-A1B-Base | 7B | [LLaDAMoeModelLM](python/dinfer/model/modeling_fused_olmoe.py) | [inclusionAI/LLaDA-MoE-7B-A1B-Base](https://huggingface.co/inclusionAI/LLaDA-MoE-7B-A1B-Base) |
@@ -198,7 +202,7 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
 ## Contact us
 - Wechat Group
 <p align="left">
-  <img src="assets/wechat.JPG" alt="Wechat Group" width="150">
+  <img src="assets/Wechat.JPG" alt="Wechat Group" width="150">
 </p>
 
 ## Citation
